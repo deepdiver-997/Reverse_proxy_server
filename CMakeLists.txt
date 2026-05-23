@@ -5,11 +5,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── Dependencies (all from brew, no FetchContent) ─────────
+# ── Dependencies ──────────────────────────────────────────
 
 # asio is header-only; brew puts it in /opt/homebrew/include (already on path)
 find_package(spdlog REQUIRED)
 find_package(toml11 REQUIRED)
+
+# lsquic + BoringSSL — pre-built in third_party/
+set(LSQUIC_ROOT ${CMAKE_SOURCE_DIR}/third_party/lsquic)
+set(BORINGSSL_ROOT ${CMAKE_SOURCE_DIR}/third_party/boringssl)
+
+add_library(lsquic STATIC IMPORTED)
+set_target_properties(lsquic PROPERTIES
+    IMPORTED_LOCATION ${LSQUIC_ROOT}/build/src/liblsquic/liblsquic.a
+    INTERFACE_INCLUDE_DIRECTORIES ${LSQUIC_ROOT}/include
+)
+target_link_libraries(lsquic INTERFACE
+    ${BORINGSSL_ROOT}/build/libssl.a
+    ${BORINGSSL_ROOT}/build/libcrypto.a
+    -lz
+)
 
 # Catch2 — brew doesn't have it, one-time FetchContent
 include(FetchContent)
