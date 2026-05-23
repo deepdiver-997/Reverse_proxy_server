@@ -34,7 +34,12 @@ int main(int argc, char* argv[]) {
     });
 
     ebpf_quic_proxy::ProxyCore proxy(io, cfg);
-    proxy.start();
+    proxy.start_tcp();
+
+    if (cfg.quic_port > 0) {
+        proxy.start_quic(cfg.quic_port, cfg.quic_cert_file,
+                         cfg.quic_key_file);
+    }
 
     spdlog::info("starting event loop...");
 

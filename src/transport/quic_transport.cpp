@@ -1,4 +1,6 @@
 #include "quic_transport.h"
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
 #include <spdlog/spdlog.h>
 #include <cstring>
 #include <sstream>
@@ -206,6 +208,15 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
     api.ea_stream_if     = &stream_if;
     api.ea_stream_if_ctx = this;
 
+    // Load TLS certificate.
+    cert_file_ = cert_file;
+    key_file_  = key_file;
+    load_tls_cert();
+
+    // Register cert lookup callback.
+    api.ea_lookup_cert     = lookup_cert_cb;
+    api.ea_cert_lu_ctx     = this;
+
     // Server mode.
     unsigned flags = LSENG_SERVER;
 
@@ -214,15 +225,16 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
         throw std::runtime_error("Failed to create lsquic engine");
 
     spdlog::info("QUIC listener created on port {}", port);
-    // TODO: load cert/key for TLS.
-    (void)cert_file;
-    (void)key_file;
 }
 
 QuicTransportListener::~QuicTransportListener() {
     if (engine_) {
         lsquic_engine_destroy(engine_);
         engine_ = nullptr;
+    }
+    if (ssl_ctx_) {
+        SSL_CTX_free(ssl_ctx_);
+        ssl_ctx_ = nullptr;
     }
 }
 
@@ -249,21 +261,28 @@ void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
         return;
     }
 
-    // Feed to lsquic.
-    struct sockaddr_storage local_sa = {};
-    struct sockaddr_storage peer_sa = {};
-    // Build sockaddr from endpoints (simplified — works for IPv4).
-    auto local_ep = socket_.local_endpoint();
-    auto local_addr = local_ep.address().to_v4().to_uint();
-    auto peer_addr = recv_endpoint_.address().to_v4().to_uint();
-    auto* lsa = reinterpret_cast<struct sockaddr_in*>(&local_sa);
-    auto* psa = reinterpret_cast<struct sockaddr_in*>(&peer_sa);
-    lsa->sin_family = AF_INET;
-    lsa->sin_port   = htons(local_ep.port());
-    lsa->sin_addr.s_addr = htonl(local_addr);
-    psa->sin_family = AF_INET;
-    psa->sin_port   = htons(recv_endpoint_.port());
-    psa->sin_addr.s_addr = htonl(peer_addr);
+    // Convert asio endpoints to sockaddr for lsquic.
+    auto to_sockaddr = [](const asio::ip::udp::endpoint& ep,
+                          struct sockaddr_storage* sa) {
+        std::memset(sa, 0, sizeof(*sa));
+        if (ep.address().is_v4()) {
+            auto* sin = reinterpret_cast<struct sockaddr_in*>(sa);
+            sin->sin_family = AF_INET;
+            sin->sin_port   = htons(ep.port());
+            auto bytes = ep.address().to_v4().to_bytes();
+            std::memcpy(&sin->sin_addr, bytes.data(), 4);
+        } else {
+            auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(sa);
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port   = htons(ep.port());
+            auto bytes = ep.address().to_v6().to_bytes();
+            std::memcpy(&sin6->sin6_addr, bytes.data(), 16);
+        }
+    };
+
+    struct sockaddr_storage local_sa, peer_sa;
+    to_sockaddr(socket_.local_endpoint(), &local_sa);
+    to_sockaddr(recv_endpoint_, &peer_sa);
 
     int r = lsquic_engine_packet_in(
         engine_, reinterpret_cast<const unsigned char*>(recv_buf_.data()), n,
@@ -313,9 +332,17 @@ QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     char buf[INET6_ADDRSTRLEN] = {};
     const struct sockaddr *local, *peer;
     lsquic_conn_get_sockaddr(conn, &local, &peer);
-    if (peer && peer->sa_family == AF_INET) {
-        auto* sin = reinterpret_cast<const struct sockaddr_in*>(peer);
-        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+    if (peer) {
+        if (peer->sa_family == AF_INET)
+            inet_ntop(AF_INET,
+                      &reinterpret_cast<const struct sockaddr_in*>(peer)
+                          ->sin_addr,
+                      buf, sizeof(buf));
+        else if (peer->sa_family == AF_INET6)
+            inet_ntop(AF_INET6,
+                      &reinterpret_cast<const struct sockaddr_in6*>(peer)
+                          ->sin6_addr,
+                      buf, sizeof(buf));
     }
     std::string addr = buf[0] ? buf : "unknown";
 
@@ -383,12 +410,20 @@ int QuicTransportListener::on_packets_out_cb(void* self,
         auto& spec = specs[i];
         asio::ip::udp::endpoint dest;
         if (spec.dest_sa->sa_family == AF_INET) {
-            auto* sin = reinterpret_cast<const struct sockaddr_in*>(spec.dest_sa);
-            dest.address(asio::ip::make_address_v4(ntohl(sin->sin_addr.s_addr)));
+            auto* sin = reinterpret_cast<const struct sockaddr_in*>(
+                spec.dest_sa);
+            dest.address(asio::ip::make_address_v4(
+                ntohl(sin->sin_addr.s_addr)));
             dest.port(ntohs(sin->sin_port));
+        } else if (spec.dest_sa->sa_family == AF_INET6) {
+            auto* sin6 = reinterpret_cast<const struct sockaddr_in6*>(
+                spec.dest_sa);
+            asio::ip::address_v6::bytes_type bytes;
+            std::memcpy(bytes.data(), &sin6->sin6_addr, 16);
+            dest.address(asio::ip::make_address_v6(bytes));
+            dest.port(ntohs(sin6->sin6_port));
         }
         // Fire-and-forget: QUIC handles retransmission itself.
-        // Each out_spec carries data in an iovec array.
         for (unsigned j = 0; j < spec.iovlen; ++j) {
             listener->socket_.async_send_to(
                 asio::buffer(spec.iov[j].iov_base, spec.iov[j].iov_len),
@@ -415,6 +450,49 @@ QuicTransportStream*
 QuicTransportListener::find_stream(lsquic_stream_t* stream) {
     auto* ctx = lsquic_stream_get_ctx(stream);
     return reinterpret_cast<QuicTransportStream*>(ctx);
+}
+
+// ── TLS cert loading ──────────────────────────────────────
+
+void QuicTransportListener::load_tls_cert() {
+    if (cert_file_.empty() || key_file_.empty()) {
+        spdlog::warn("QUIC: no cert/key configured, TLS won't work");
+        return;
+    }
+
+    ssl_ctx_ = SSL_CTX_new(TLS_method());
+    if (!ssl_ctx_) {
+        spdlog::error("QUIC: SSL_CTX_new failed");
+        return;
+    }
+
+    // Load certificate chain.
+    if (SSL_CTX_use_certificate_file(ssl_ctx_, cert_file_.c_str(),
+                                     SSL_FILETYPE_PEM) != 1) {
+        spdlog::error("QUIC: failed to load cert file: {}", cert_file_);
+        SSL_CTX_free(ssl_ctx_);
+        ssl_ctx_ = nullptr;
+        return;
+    }
+
+    // Load private key.
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx_, key_file_.c_str(),
+                                    SSL_FILETYPE_PEM) != 1) {
+        spdlog::error("QUIC: failed to load key file: {}", key_file_);
+        SSL_CTX_free(ssl_ctx_);
+        ssl_ctx_ = nullptr;
+        return;
+    }
+
+    spdlog::info("QUIC TLS cert loaded: {}", cert_file_);
+}
+
+struct ssl_ctx_st*
+QuicTransportListener::lookup_cert_cb(void* self,
+                                       const struct sockaddr* /*local*/,
+                                       const char* /*sni*/) {
+    auto* listener = static_cast<QuicTransportListener*>(self);
+    return listener->ssl_ctx_;
 }
 
 } // namespace ebpf_quic_proxy

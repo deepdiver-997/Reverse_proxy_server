@@ -8,6 +8,7 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <unordered_map>
 
 namespace ebpf_quic_proxy {
 
@@ -113,6 +114,14 @@ private:
     asio::steady_timer tick_timer_;
     lsquic_engine_t* engine_ = nullptr;
     NewSessionCallback new_session_cb_;
+
+    // TLS — loaded once, shared by all QUIC connections.
+    struct ssl_ctx_st* ssl_ctx_ = nullptr; // SSL_CTX*
+    std::string cert_file_, key_file_;
+    void load_tls_cert();
+    static struct ssl_ctx_st* lookup_cert_cb(void* self,
+                                              const struct sockaddr* local,
+                                              const char* sni);
 
     // Receiving.
     std::array<char, 65536> recv_buf_{};

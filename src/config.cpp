@@ -19,6 +19,14 @@ ProxyConfig load_config(const std::string& path) {
                 toml::find_or<int>(tbl, "port", 8080);
             cfg.num_threads =
                 toml::find_or<int>(tbl, "num_threads", 1);
+            cfg.quic_port =
+                toml::find_or<int>(tbl, "quic_port", 0);
+            cfg.quic_cert_file =
+                toml::find_or<std::string>(tbl, "quic_cert_file",
+                                           "certs/cert.pem");
+            cfg.quic_key_file =
+                toml::find_or<std::string>(tbl, "quic_key_file",
+                                           "certs/key.pem");
         }
 
         // [[backends]]

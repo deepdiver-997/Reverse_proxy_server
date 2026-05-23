@@ -18,7 +18,7 @@ set(BORINGSSL_ROOT ${CMAKE_SOURCE_DIR}/third_party/boringssl)
 add_library(lsquic STATIC IMPORTED)
 set_target_properties(lsquic PROPERTIES
     IMPORTED_LOCATION ${LSQUIC_ROOT}/build/src/liblsquic/liblsquic.a
-    INTERFACE_INCLUDE_DIRECTORIES ${LSQUIC_ROOT}/include
+    INTERFACE_INCLUDE_DIRECTORIES "${LSQUIC_ROOT}/include;${BORINGSSL_ROOT}/include"
 )
 target_link_libraries(lsquic INTERFACE
     ${BORINGSSL_ROOT}/build/libssl.a

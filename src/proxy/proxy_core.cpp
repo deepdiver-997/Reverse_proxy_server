@@ -9,10 +9,10 @@ namespace ebpf_quic_proxy {
 ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     : io_(io), codec_(std::make_unique<H1Codec>()), upstream_pool_(io) {
 
-    // Build listener.
+    // Build TCP listener.
     auto ep = asio::ip::tcp::endpoint(
         asio::ip::make_address(cfg.listen_addr), cfg.listen_port);
-    listener_ =
+    tcp_listener_ =
         std::make_shared<TcpTransportListener>(io, ep);
 
     // Build router.
@@ -28,10 +28,25 @@ ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     spdlog::info("  backends: {}", cfg.backends.size());
 }
 
-void ProxyCore::start() { do_accept(); }
+void ProxyCore::start_tcp() { do_accept(); }
+
+void ProxyCore::start_quic(uint16_t port, const std::string& cert_file,
+                            const std::string& key_file) {
+    quic_listener_ = std::make_unique<QuicTransportListener>(
+        io_, port, cert_file, key_file);
+
+    quic_listener_->set_new_session_cb(
+        [this](QuicTransportSessionPtr session) {
+            spdlog::debug("new QUIC session from {}", session->remote_addr());
+            on_session(std::move(session));
+        });
+
+    quic_listener_->start();
+    spdlog::info("QUIC listener started on port {}", port);
+}
 
 void ProxyCore::do_accept() {
-    listener_->async_accept(
+    tcp_listener_->async_accept(
         [this](ITransportSessionPtr session) {
             if (!session) {
                 spdlog::error("accept failed, stopping");
