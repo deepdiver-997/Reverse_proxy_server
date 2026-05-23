@@ -44,6 +44,7 @@ add_executable(ebpf-quic-proxy
     src/transport/quic_transport.cpp
     src/codec/http_message.cpp
     src/codec/h1_codec.cpp
+    src/codec/h3_codec.cpp
     src/proxy/router.cpp
     src/proxy/upstream_pool.cpp
     src/proxy/proxy_core.cpp
@@ -60,10 +61,13 @@ target_link_libraries(ebpf-quic-proxy PRIVATE
 
 add_executable(proxy_tests
     tests/test_h1_codec.cpp
+    tests/test_h3_codec.cpp
     src/codec/h1_codec.cpp
+    src/codec/h3_codec.cpp
     src/codec/http_message.cpp
 )
 target_include_directories(proxy_tests PRIVATE src /opt/homebrew/include)
 target_link_libraries(proxy_tests PRIVATE
     Catch2::Catch2WithMain
+    spdlog::spdlog
 )
