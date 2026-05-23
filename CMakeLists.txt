@@ -41,6 +41,7 @@ add_executable(ebpf-quic-proxy
     src/main.cpp
     src/config.cpp
     src/transport/tcp_transport.cpp
+    src/transport/quic_transport.cpp
     src/codec/http_message.cpp
     src/codec/h1_codec.cpp
     src/proxy/router.cpp
@@ -52,6 +53,7 @@ target_include_directories(ebpf-quic-proxy PRIVATE src)
 target_link_libraries(ebpf-quic-proxy PRIVATE
     spdlog::spdlog
     toml11::toml11
+    lsquic
 )
 
 # ── Tests ─────────────────────────────────────────────────
