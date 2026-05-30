@@ -34,6 +34,7 @@ class TcpTransportSession final
 public:
     explicit TcpTransportSession(asio::ip::tcp::socket socket);
 
+    TransportProtocol protocol() const override;
     void set_new_stream_cb(NewStreamCallback cb) override;
     ITransportStreamPtr open_stream() override;
     void close() override;

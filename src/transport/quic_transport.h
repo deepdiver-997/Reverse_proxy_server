@@ -2,7 +2,9 @@
 
 #include "itransport_stream.h"
 #include "itransport_session.h"
+extern "C" {
 #include <lsquic.h>
+}
 #include <asio.hpp>
 #include <functional>
 #include <memory>
@@ -67,6 +69,7 @@ public:
                          std::string remote_addr);
     ~QuicTransportSession() override;
 
+    TransportProtocol protocol() const override;
     void set_new_stream_cb(NewStreamCallback cb) override;
     ITransportStreamPtr open_stream() override;
     void close() override;
@@ -112,16 +115,20 @@ private:
     asio::io_context& io_;
     asio::ip::udp::socket socket_;
     asio::steady_timer tick_timer_;
+    int raw_fd_ = -1; // native fd for synchronous sendto
     lsquic_engine_t* engine_ = nullptr;
     NewSessionCallback new_session_cb_;
 
     // TLS — loaded once, shared by all QUIC connections.
     struct ssl_ctx_st* ssl_ctx_ = nullptr; // SSL_CTX*
+    static inline struct ssl_ctx_st* s_ssl_ctx_ = nullptr;
     std::string cert_file_, key_file_;
     void load_tls_cert();
     static struct ssl_ctx_st* lookup_cert_cb(void* self,
                                               const struct sockaddr* local,
                                               const char* sni);
+    static struct ssl_ctx_st* get_ssl_ctx_cb(void* peer_ctx,
+                                              const struct sockaddr* local);
 
     // Receiving.
     std::array<char, 65536> recv_buf_{};

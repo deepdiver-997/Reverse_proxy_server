@@ -7,6 +7,10 @@
 
 namespace ebpf_quic_proxy {
 
+/// Identifies the transport protocol — used by ProxyCore to select the
+/// correct codec (H1 for TCP, H3 for QUIC).
+enum class TransportProtocol { TCP, QUIC };
+
 /// A transport session is the "connection" abstraction above streams.
 /// TCP: 1 session = 1 connection, 1 fixed stream.
 /// QUIC: 1 session = 1 connection, N dynamically-opened streams.
@@ -16,6 +20,9 @@ public:
         std::function<void(ITransportStreamPtr)>;
 
     virtual ~ITransportSession() = default;
+
+    /// Which protocol this session uses.
+    virtual TransportProtocol protocol() const = 0;
 
     /// Register a callback that fires each time the remote peer opens a stream.
     /// TCP: fires exactly once, synchronously inside set_new_stream_cb().

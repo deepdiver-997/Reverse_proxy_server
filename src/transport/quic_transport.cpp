@@ -1,6 +1,8 @@
 #include "quic_transport.h"
+extern "C" {
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
+}
 #include <spdlog/spdlog.h>
 #include <cstring>
 #include <sstream>
@@ -143,6 +145,10 @@ QuicTransportSession::~QuicTransportSession() {
         lsquic_conn_set_ctx(conn_, nullptr);
 }
 
+TransportProtocol QuicTransportSession::protocol() const {
+    return TransportProtocol::QUIC;
+}
+
 void QuicTransportSession::set_new_stream_cb(NewStreamCallback cb) {
     new_stream_cb_ = std::move(cb);
 }
@@ -189,12 +195,25 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
                                              const std::string& key_file)
     : io_(io),
       socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v4(), port)),
-      tick_timer_(io) {
+      tick_timer_(io),
+      raw_fd_(socket_.native_handle()) {
 
     // ── Build lsquic engine ───────────────────────────────
-    struct lsquic_engine_api api = {};
-    api.ea_packets_out     = on_packets_out_cb;
-    api.ea_packets_out_ctx = this;
+    // One-time global QUIC/TLS init (needed exactly once per process).
+    static bool s_global_inited = false;
+    if (!s_global_inited) {
+        if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
+            spdlog::error("QUIC: lsquic_global_init failed");
+            throw std::runtime_error("lsquic_global_init");
+        }
+        s_global_inited = true;
+        spdlog::info("QUIC global init done");
+    }
+
+    // Load TLS certificate.
+    cert_file_ = cert_file;
+    key_file_  = key_file;
+    load_tls_cert();
 
     // Stream callbacks.
     static struct lsquic_stream_if stream_if = {
@@ -205,20 +224,22 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
         .on_write       = on_write_cb,
         .on_close       = on_close_cb,
     };
-    api.ea_stream_if     = &stream_if;
-    api.ea_stream_if_ctx = this;
 
-    // Load TLS certificate.
-    cert_file_ = cert_file;
-    key_file_  = key_file;
-    load_tls_cert();
-
-    // Register cert lookup callback.
+    struct lsquic_engine_api api = {};
+    api.ea_packets_out     = on_packets_out_cb;
+    api.ea_packets_out_ctx = this;
+    api.ea_stream_if       = &stream_if;
+    api.ea_stream_if_ctx   = this;
     api.ea_lookup_cert     = lookup_cert_cb;
     api.ea_cert_lu_ctx     = this;
+    api.ea_get_ssl_ctx     = get_ssl_ctx_cb;
 
-    // Server mode.
-    unsigned flags = LSENG_SERVER;
+    // Engine settings — use defaults (like echo_server).
+    struct lsquic_engine_settings settings;
+    lsquic_engine_init_settings(&settings, LSENG_SERVER | LSENG_HTTP);
+    api.ea_settings = &settings;
+
+    unsigned flags = LSENG_SERVER;  // raw streams — we do H3 framing ourselves
 
     engine_ = lsquic_engine_new(flags, &api);
     if (!engine_)
@@ -233,8 +254,10 @@ QuicTransportListener::~QuicTransportListener() {
         engine_ = nullptr;
     }
     if (ssl_ctx_) {
-        SSL_CTX_free(ssl_ctx_);
+        auto* ctx = ssl_ctx_;
         ssl_ctx_ = nullptr;
+        s_ssl_ctx_ = nullptr;
+        SSL_CTX_free(ctx);
     }
 }
 
@@ -260,6 +283,9 @@ void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
         spdlog::error("QUIC UDP recv error: {}", ec.message());
         return;
     }
+
+    spdlog::debug("QUIC UDP recv {} bytes from {}", n,
+                  recv_endpoint_.address().to_string());
 
     // Convert asio endpoints to sockaddr for lsquic.
     auto to_sockaddr = [](const asio::ip::udp::endpoint& ep,
@@ -288,13 +314,19 @@ void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
         engine_, reinterpret_cast<const unsigned char*>(recv_buf_.data()), n,
         reinterpret_cast<const struct sockaddr*>(&local_sa),
         reinterpret_cast<const struct sockaddr*>(&peer_sa),
-        this, // conn_ctx for new connections
-        0     // ecn
+        nullptr, // conn_ctx — NULL is fine, we find sessions via stream_if_ctx
+        0        // ecn
     );
 
     if (r < 0) {
         spdlog::warn("lsquic_engine_packet_in returned {}", r);
     }
+
+    // Process connections immediately after receiving a packet.
+    // This flushes outgoing packets (e.g. TLS Handshake) that the
+    // engine needs to send as part of the QUIC handshake.
+    lsquic_engine_process_conns(engine_);
+    schedule_tick();
 
     // Continue receiving.
     do_recv();
@@ -346,13 +378,18 @@ QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     }
     std::string addr = buf[0] ? buf : "unknown";
 
+    spdlog::debug("QUIC on_new_conn from {} (conn={})", addr,
+                  reinterpret_cast<void*>(conn));
+
     auto session = std::make_shared<QuicTransportSession>(conn, addr);
     auto* ctx = reinterpret_cast<lsquic_conn_ctx_t*>(session.get());
     listener->sessions_[ctx] = std::move(session);
 
     // Notify ProxyCore.
-    if (listener->new_session_cb_)
+    if (listener->new_session_cb_) {
+        spdlog::debug("QUIC notifying ProxyCore of new session");
         listener->new_session_cb_(listener->sessions_[ctx]);
+    }
 
     return ctx;
 }
@@ -371,6 +408,7 @@ lsquic_stream_ctx_t*
 QuicTransportListener::on_new_stream_cb(void* self, lsquic_stream_t* stream) {
     auto* listener = static_cast<QuicTransportListener*>(self);
     auto* conn = lsquic_stream_conn(stream);
+    spdlog::debug("QUIC on_new_stream (stream={})", reinterpret_cast<void*>(stream));
     auto* session = listener->find_session(conn);
     if (session) {
         session->on_new_stream(stream);
@@ -383,6 +421,7 @@ QuicTransportListener::on_new_stream_cb(void* self, lsquic_stream_t* stream) {
 
 void QuicTransportListener::on_read_cb(lsquic_stream_t* stream,
                                         lsquic_stream_ctx_t* ctx) {
+    spdlog::debug("QUIC on_read (stream={})", reinterpret_cast<void*>(stream));
     auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
     if (qstream)
         qstream->on_readable();
@@ -406,8 +445,15 @@ int QuicTransportListener::on_packets_out_cb(void* self,
                                               const lsquic_out_spec* specs,
                                               unsigned count) {
     auto* listener = static_cast<QuicTransportListener*>(self);
+    asio::error_code ec;
+    unsigned sent = 0;
+
+    spdlog::debug("QUIC packets_out: {} specs", count);
+
     for (unsigned i = 0; i < count; ++i) {
         auto& spec = specs[i];
+
+        // Build asio endpoint from raw sockaddr.
         asio::ip::udp::endpoint dest;
         if (spec.dest_sa->sa_family == AF_INET) {
             auto* sin = reinterpret_cast<const struct sockaddr_in*>(
@@ -423,14 +469,30 @@ int QuicTransportListener::on_packets_out_cb(void* self,
             dest.address(asio::ip::make_address_v6(bytes));
             dest.port(ntohs(sin6->sin6_port));
         }
-        // Fire-and-forget: QUIC handles retransmission itself.
+
+        // Synchronous send — QUIC engine expects data to be on the wire
+        // before the callback returns.  UDP send_to is non-blocking in
+        // practice (just copies to kernel buffer).
         for (unsigned j = 0; j < spec.iovlen; ++j) {
-            listener->socket_.async_send_to(
-                asio::buffer(spec.iov[j].iov_base, spec.iov[j].iov_len),
-                dest, [](asio::error_code, std::size_t) {});
+            // Use raw sendto to rule out asio issues.
+            ssize_t n = sendto(listener->raw_fd_,
+                               spec.iov[j].iov_base,
+                               spec.iov[j].iov_len,
+                               0,
+                               spec.dest_sa,
+                               spec.dest_sa->sa_family == AF_INET
+                                   ? sizeof(struct sockaddr_in)
+                                   : sizeof(struct sockaddr_in6));
+            if (n < 0) {
+                spdlog::debug("QUIC sendto failed: {} (errno={})",
+                              strerror(errno), errno);
+            } else {
+                ++sent;
+            }
         }
     }
-    return 0;
+
+    return sent;  // tell lsquic how many packets were actually sent
 }
 
 // ── Lookup helpers ────────────────────────────────────────
@@ -454,6 +516,24 @@ QuicTransportListener::find_stream(lsquic_stream_t* stream) {
 
 // ── TLS cert loading ──────────────────────────────────────
 
+// ALPN protocol list (length-prefixed wire format).
+// Supports H3 (HTTP/3) and H3-29 (older draft for compatibility).
+static const char kQuicAlpn[] = "\x02h3\x05h3-29";
+
+static int select_alpn_cb(SSL* ssl, const unsigned char** out,
+                          unsigned char* outlen, const unsigned char* in,
+                          unsigned int inlen, void* /*arg*/) {
+    int r = SSL_select_next_proto(const_cast<unsigned char**>(out), outlen,
+                                  in, inlen,
+                                  reinterpret_cast<const unsigned char*>(kQuicAlpn),
+                                  sizeof(kQuicAlpn) - 1);
+    if (r == OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_OK;
+    spdlog::warn("QUIC: no supported ALPN from {:.{}}",
+                 reinterpret_cast<const char*>(in), inlen);
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
 void QuicTransportListener::load_tls_cert() {
     if (cert_file_.empty() || key_file_.empty()) {
         spdlog::warn("QUIC: no cert/key configured, TLS won't work");
@@ -467,8 +547,8 @@ void QuicTransportListener::load_tls_cert() {
     }
 
     // Load certificate chain.
-    if (SSL_CTX_use_certificate_file(ssl_ctx_, cert_file_.c_str(),
-                                     SSL_FILETYPE_PEM) != 1) {
+    if (SSL_CTX_use_certificate_chain_file(ssl_ctx_,
+                                            cert_file_.c_str()) != 1) {
         spdlog::error("QUIC: failed to load cert file: {}", cert_file_);
         SSL_CTX_free(ssl_ctx_);
         ssl_ctx_ = nullptr;
@@ -484,15 +564,34 @@ void QuicTransportListener::load_tls_cert() {
         return;
     }
 
+    // Restrict to TLS 1.3 (QUIC requires it).
+    SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
+
+    // ALPN callback for QUIC protocol negotiation (QUIC requires ALPN).
+    SSL_CTX_set_alpn_select_cb(ssl_ctx_, select_alpn_cb, nullptr);
+    spdlog::debug("QUIC ALPN callback set (h3, h3-29)");
+
+    s_ssl_ctx_ = ssl_ctx_;
     spdlog::info("QUIC TLS cert loaded: {}", cert_file_);
 }
 
 struct ssl_ctx_st*
 QuicTransportListener::lookup_cert_cb(void* self,
                                        const struct sockaddr* /*local*/,
-                                       const char* /*sni*/) {
+                                       const char* sni) {
     auto* listener = static_cast<QuicTransportListener*>(self);
+    spdlog::debug("QUIC lookup_cert_cb sni={} ssl_ctx={}",
+                  sni ? sni : "(null)", static_cast<void*>(listener->ssl_ctx_));
     return listener->ssl_ctx_;
+}
+
+struct ssl_ctx_st*
+QuicTransportListener::get_ssl_ctx_cb(void* peer_ctx,
+                                       const struct sockaddr* /*local*/) {
+    spdlog::debug("QUIC get_ssl_ctx_cb peer_ctx={} ssl_ctx={}",
+                  peer_ctx, static_cast<void*>(s_ssl_ctx_));
+    return s_ssl_ctx_;
 }
 
 } // namespace ebpf_quic_proxy

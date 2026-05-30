@@ -26,14 +26,8 @@ target_link_libraries(lsquic INTERFACE
     -lz
 )
 
-# Catch2 — brew doesn't have it, one-time FetchContent
-include(FetchContent)
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG        v3.7.1
-)
-FetchContent_MakeAvailable(Catch2)
+# Catch2 (brew install catch2)
+find_package(Catch2 REQUIRED)
 
 # ── Main executable ───────────────────────────────────────
 
@@ -50,7 +44,10 @@ add_executable(ebpf-quic-proxy
     src/proxy/proxy_core.cpp
 )
 
-target_include_directories(ebpf-quic-proxy PRIVATE src)
+target_include_directories(ebpf-quic-proxy PRIVATE
+    src
+    ${BORINGSSL_ROOT}/include   # MUST come before system paths
+)
 target_link_libraries(ebpf-quic-proxy PRIVATE
     spdlog::spdlog
     toml11::toml11

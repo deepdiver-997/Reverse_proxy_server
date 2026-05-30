@@ -46,6 +46,10 @@ TcpTransportSession::TcpTransportSession(asio::ip::tcp::socket socket)
     remote_addr_ = stream_->stream_id();
 }
 
+TransportProtocol TcpTransportSession::protocol() const {
+    return TransportProtocol::TCP;
+}
+
 void TcpTransportSession::set_new_stream_cb(NewStreamCallback cb) {
     // TCP / HTTP/1.1: exactly one stream, deliver it immediately.
     cb(stream_);

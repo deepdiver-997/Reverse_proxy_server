@@ -1,5 +1,6 @@
 #include "proxy_core.h"
 #include "codec/h1_codec.h"
+#include "codec/h3_codec.h"
 #include "transport/tcp_transport.h"
 #include <spdlog/spdlog.h>
 
@@ -7,7 +8,10 @@ namespace ebpf_quic_proxy {
 
 
 ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
-    : io_(io), codec_(std::make_unique<H1Codec>()), upstream_pool_(io) {
+    : io_(io),
+      h1_codec_(std::make_unique<H1Codec>()),
+      h3_codec_(std::make_unique<H3Codec>()),
+      upstream_pool_(io) {
 
     // Build TCP listener.
     auto ep = asio::ip::tcp::endpoint(
@@ -60,18 +64,26 @@ void ProxyCore::do_accept() {
 }
 
 void ProxyCore::on_session(ITransportSessionPtr session) {
+    // Pick the right codec based on transport protocol.
+    auto* codec =
+        (session->protocol() == TransportProtocol::QUIC)
+            ? static_cast<ICodec*>(h3_codec_.get())
+            : static_cast<ICodec*>(h1_codec_.get());
+
     // When the session has a new stream, hand it off.
     // TCP: fires synchronously inside set_new_stream_cb.
     session->set_new_stream_cb(
-        [this](ITransportStreamPtr stream) { on_stream(std::move(stream)); });
+        [this, codec](ITransportStreamPtr stream) {
+            on_stream(std::move(stream), codec);
+        });
 }
 
-void ProxyCore::on_stream(ITransportStreamPtr stream) {
+void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     spdlog::debug("new stream {}", stream->stream_id());
 
     // Parse the request.
     auto* raw = stream.get();
-    codec_->async_parse_request(
+    codec->async_parse_request(
         stream, [this, stream](asio::error_code ec,
                                 HttpRequestHead head, BodySourcePtr body) {
             if (ec) {
