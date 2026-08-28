@@ -14,6 +14,8 @@ extern "C" {
 
 namespace ebpf_quic_proxy {
 
+class QuicTransportListener; // fwd — sessions hold a back-pointer for cleanup
+
 // ── QuicTransportStream ───────────────────────────────────
 
 /// ITransportStream backed by an lsquic stream.
@@ -35,6 +37,7 @@ public:
     void on_readable();
     void on_writeable();
     void on_close();
+    void on_reset(int how); // how: 0=read, 1=write, 2=both (shutdown(2) style)
 
 private:
     lsquic_stream_t* stream_;
@@ -45,8 +48,12 @@ private:
     asio::mutable_buffer read_buf_{};
 
     // Pending write callback + queue.
+    // `offset` tracks how much of `data` has already been handed to lsquic:
+    // lsquic_stream_write() may accept fewer bytes than requested, so the
+    // remaining tail stays queued until on_writeable() lets us continue.
     struct WriteOp {
         std::shared_ptr<std::vector<char>> data;
+        std::size_t offset = 0;
         WriteCallback cb;
     };
     std::queue<WriteOp> write_queue_;
@@ -79,11 +86,18 @@ public:
     void on_new_stream(lsquic_stream_t* lsquic_stream);
     void on_closed();
 
+    // Back-pointer to the owning listener. Needed because the static
+    // lsquic callbacks (e.g. on_conn_closed) receive only the conn_ctx and
+    // must reach the listener to drop this session from sessions_.
+    void set_listener(QuicTransportListener* l) { listener_ = l; }
+    QuicTransportListener* listener() const { return listener_; }
+
 private:
     lsquic_conn_t* conn_;
     std::string remote_addr_;
     NewStreamCallback new_stream_cb_;
     bool closed_ = false;
+    QuicTransportListener* listener_ = nullptr;
 };
 
 using QuicTransportSessionPtr = std::shared_ptr<QuicTransportSession>;
@@ -144,6 +158,15 @@ private:
     void schedule_tick();
     void on_tick(asio::error_code ec);
 
+    // Sending: when on_packets_out hits EAGAIN, arm a writability watch and
+    // flush lsquic's unsent packets once the socket drains.
+    void arm_send_retry();
+    bool send_retry_armed_ = false;
+
+    /// Erase a session from sessions_ by its conn_ctx key and return it,
+    /// so callers can keep it alive across a cleanup callback.
+    QuicTransportSessionPtr take_session(lsquic_conn_ctx_t* key);
+
     // ── lsquic callbacks ──────────────────────────────────
     static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
     static void on_conn_closed_cb(lsquic_conn_t* conn);
@@ -155,6 +178,8 @@ private:
                             lsquic_stream_ctx_t* ctx);
     static void on_close_cb(lsquic_stream_t* stream,
                             lsquic_stream_ctx_t* ctx);
+    static void on_reset_cb(lsquic_stream_t* stream,
+                            lsquic_stream_ctx_t* ctx, int how);
     static int on_packets_out_cb(void* self,
                                  const lsquic_out_spec* specs,
                                  unsigned count);

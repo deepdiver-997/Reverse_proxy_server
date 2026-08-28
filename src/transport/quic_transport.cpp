@@ -4,6 +4,7 @@ extern "C" {
 #include <openssl/ssl.h>
 }
 #include <spdlog/spdlog.h>
+#include <cerrno>
 #include <cstring>
 #include <sstream>
 
@@ -40,7 +41,7 @@ void QuicTransportStream::async_write_some(asio::const_buffer buf,
     auto data = std::make_shared<std::vector<char>>(
         static_cast<const char*>(buf.data()),
         static_cast<const char*>(buf.data()) + buf.size());
-    write_queue_.push({std::move(data), std::move(cb)});
+    write_queue_.push({std::move(data), /*offset=*/0, std::move(cb)});
     pump_write();
 }
 
@@ -69,14 +70,24 @@ void QuicTransportStream::on_readable() {
     lsquic_stream_wantread(stream_, 0);
 
     if (n >= 0) {
+        // n == 0 means EOF (per lsquic_stream_read contract).
         auto cb = std::move(read_cb_);
         cb({}, static_cast<std::size_t>(n));
     } else if (n == -1) {
-        // Error — treat as EOF for now.
+        // -1 carries the reason in errno.  Disambiguate so we don't report
+        // "no data yet" or "peer reset" as a clean EOF.
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            // No data actually available (wantread was a false alarm).
+            // Keep the callback pending and re-arm.
+            lsquic_stream_wantread(stream_, 1);
+            return;
+        }
         auto cb = std::move(read_cb_);
-        cb(asio::error::eof, 0);
+        if (errno == ECONNRESET)
+            cb(asio::error::connection_reset, 0);
+        else
+            cb(asio::error::eof, 0);
     }
-    // n == -2 means no data yet (shouldn't happen if wantread signalled).
 }
 
 void QuicTransportStream::on_writeable() {
@@ -99,32 +110,78 @@ void QuicTransportStream::on_close() {
         auto cb = std::move(shutdown_cb_);
         cb({});
     }
+    writing_ = false;
     stream_ = nullptr;
 }
 
+void QuicTransportStream::on_reset(int how) {
+    spdlog::debug("QUIC stream {} reset (how={})", id_, how);
+    // The peer reset one or both directions.  Unblock any pending operations
+    // so they don't hang waiting for on_close() (which follows later).
+    if (how == 0 || how == 2) { // read side reset
+        if (read_cb_) {
+            auto cb = std::move(read_cb_);
+            cb(asio::error::connection_reset, 0);
+        }
+    }
+    if (how == 1 || how == 2) { // write side reset
+        while (!write_queue_.empty()) {
+            auto& op = write_queue_.front();
+            op.cb(asio::error::connection_reset, 0);
+            write_queue_.pop();
+        }
+        writing_ = false;
+    }
+}
+
 void QuicTransportStream::pump_write() {
+    // Stream may have been closed before we got here.
+    if (!stream_) {
+        // Flush pending callbacks with EOF.
+        while (!write_queue_.empty()) {
+            auto& op = write_queue_.front();
+            op.cb(asio::error::eof, 0);
+            write_queue_.pop();
+        }
+        return;
+    }
     if (writing_ || write_queue_.empty())
         return;
 
     auto& op = write_queue_.front();
-    ssize_t n = lsquic_stream_write(
-        stream_, reinterpret_cast<const unsigned char*>(op.data->data()),
-        op.data->size());
+    const auto* base = op.data->data() + op.offset;
+    std::size_t remaining = op.data->size() - op.offset;
 
-    if (n >= 0) {
-        auto cb = std::move(op.cb);
-        write_queue_.pop();
-        cb({}, static_cast<std::size_t>(n));
-        // If more pending, will be pumped by on_writeable.
-    } else if (n == -1) {
-        // Error
-        auto cb = std::move(op.cb);
-        write_queue_.pop();
-        cb(asio::error::eof, 0);
-    } else {
-        // n == -2: would block → enable write notification.
+    ssize_t n = lsquic_stream_write(
+        stream_, reinterpret_cast<const unsigned char*>(base), remaining);
+
+    if (n > 0) {
+        op.offset += static_cast<std::size_t>(n);
+        if (op.offset >= op.data->size()) {
+            // Whole op accepted — complete it.
+            auto cb = std::move(op.cb);
+            std::size_t total = op.offset;
+            write_queue_.pop();
+            cb({}, total);
+            // Remaining ops are pumped from on_writeable().
+        } else {
+            // Partial write: keep the tail queued, resume on on_writeable().
+            writing_ = true;
+            lsquic_stream_wantwrite(stream_, 1);
+        }
+    } else if (n == 0) {
+        // Nothing accepted right now (buffer/flow-control full).
         writing_ = true;
         lsquic_stream_wantwrite(stream_, 1);
+    } else {
+        // Error. errno: ECONNRESET (reset), EBADF (write side closed),
+        // EILSEQ (headers not sent yet in H3 mode).
+        auto cb = std::move(op.cb);
+        write_queue_.pop();
+        auto ec = (errno == ECONNRESET)
+                      ? asio::error_code(asio::error::connection_reset)
+                      : asio::error_code(asio::error::eof);
+        cb(ec, 0);
     }
 }
 
@@ -223,9 +280,34 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
         .on_read        = on_read_cb,
         .on_write       = on_write_cb,
         .on_close       = on_close_cb,
+        .on_reset       = on_reset_cb,
+    };
+
+    // HSI interface — lsquic uses this to decode H3 headers.
+    // We provide the very minimum to keep lsquic's H3 processing happy;
+    // actual header data is read separately through the stream.
+    static const struct lsquic_hset_if kHsiIf = {
+        .hsi_create_header_set = +[](void *, lsquic_stream_t *, int) -> void* {
+            return malloc(1);
+        },
+        .hsi_prepare_decode = +[](void *, struct lsxpack_header *, size_t)
+                                -> struct lsxpack_header* {
+            // Return nullptr — we don't decode headers here.
+            // lsquic will skip QPACK decode and just pass raw stream data.
+            return nullptr;
+        },
+        .hsi_process_header = +[](void *, struct lsxpack_header *) -> int {
+            return 0;
+        },
+        .hsi_discard_header_set = +[](void *hdr_set) {
+            free(hdr_set);
+        },
+        .hsi_flags = (enum lsquic_hsi_flag)0,
     };
 
     struct lsquic_engine_api api = {};
+    api.ea_hsi_if         = &kHsiIf;
+    api.ea_hsi_ctx        = nullptr;
     api.ea_packets_out     = on_packets_out_cb;
     api.ea_packets_out_ctx = this;
     api.ea_stream_if       = &stream_if;
@@ -234,12 +316,12 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
     api.ea_cert_lu_ctx     = this;
     api.ea_get_ssl_ctx     = get_ssl_ctx_cb;
 
-    // Engine settings — use defaults (like echo_server).
+    // Engine settings — use defaults.
     struct lsquic_engine_settings settings;
     lsquic_engine_init_settings(&settings, LSENG_SERVER | LSENG_HTTP);
     api.ea_settings = &settings;
 
-    unsigned flags = LSENG_SERVER;  // raw streams — we do H3 framing ourselves
+    unsigned flags = LSENG_SERVER | LSENG_HTTP;
 
     engine_ = lsquic_engine_new(flags, &api);
     if (!engine_)
@@ -280,7 +362,15 @@ void QuicTransportListener::do_recv() {
 
 void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
     if (ec) {
-        spdlog::error("QUIC UDP recv error: {}", ec.message());
+        if (ec == asio::error::operation_aborted) {
+            spdlog::debug("QUIC UDP recv stopped (socket closing)");
+            return; // shutdown — do not re-arm
+        }
+        // Transient error (e.g. ENETDOWN).  Re-arm so the listener survives;
+        // otherwise one bad packet kills the whole receive loop.
+        spdlog::warn("QUIC UDP recv error: {} — re-arming", ec.message());
+        if (socket_.is_open())
+            do_recv();
         return;
     }
 
@@ -382,6 +472,7 @@ QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
                   reinterpret_cast<void*>(conn));
 
     auto session = std::make_shared<QuicTransportSession>(conn, addr);
+    session->set_listener(listener); // lets on_conn_closed reach us
     auto* ctx = reinterpret_cast<lsquic_conn_ctx_t*>(session.get());
     listener->sessions_[ctx] = std::move(session);
 
@@ -398,9 +489,17 @@ void QuicTransportListener::on_conn_closed_cb(lsquic_conn_t* conn) {
     auto* ctx = lsquic_conn_get_ctx(conn);
     if (!ctx)
         return;
-    // We don't have a direct reference to the listener here.
-    // The session will clean itself up.
     auto* session = reinterpret_cast<QuicTransportSession*>(ctx);
+    auto* listener = session->listener();
+    if (!listener) {
+        session->on_closed();
+        return;
+    }
+    // Erase the session from the map, but keep a shared_ptr copy so the
+    // session outlives on_closed() — erasing is what releases the map's
+    // reference, and without this copy on_closed() would destroy `this`
+    // while still inside its own member function.
+    auto keep_alive = listener->take_session(ctx);
     session->on_closed();
 }
 
@@ -441,11 +540,17 @@ void QuicTransportListener::on_close_cb(lsquic_stream_t* stream,
         qstream->on_close();
 }
 
+void QuicTransportListener::on_reset_cb(lsquic_stream_t* stream,
+                                         lsquic_stream_ctx_t* ctx, int how) {
+    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
+    if (qstream)
+        qstream->on_reset(how);
+}
+
 int QuicTransportListener::on_packets_out_cb(void* self,
                                               const lsquic_out_spec* specs,
                                               unsigned count) {
     auto* listener = static_cast<QuicTransportListener*>(self);
-    asio::error_code ec;
     unsigned sent = 0;
 
     spdlog::debug("QUIC packets_out: {} specs", count);
@@ -453,49 +558,69 @@ int QuicTransportListener::on_packets_out_cb(void* self,
     for (unsigned i = 0; i < count; ++i) {
         auto& spec = specs[i];
 
-        // Build asio endpoint from raw sockaddr.
-        asio::ip::udp::endpoint dest;
-        if (spec.dest_sa->sa_family == AF_INET) {
-            auto* sin = reinterpret_cast<const struct sockaddr_in*>(
-                spec.dest_sa);
-            dest.address(asio::ip::make_address_v4(
-                ntohl(sin->sin_addr.s_addr)));
-            dest.port(ntohs(sin->sin_port));
-        } else if (spec.dest_sa->sa_family == AF_INET6) {
-            auto* sin6 = reinterpret_cast<const struct sockaddr_in6*>(
-                spec.dest_sa);
-            asio::ip::address_v6::bytes_type bytes;
-            std::memcpy(bytes.data(), &sin6->sin6_addr, 16);
-            dest.address(asio::ip::make_address_v6(bytes));
-            dest.port(ntohs(sin6->sin6_port));
-        }
+        // Use sendmsg (scatter-gather) so all iovs in this spec
+        // go out as a single UDP datagram, matching lsquic's expectation.
+        struct msghdr hdr = {};
+        hdr.msg_name       = const_cast<struct sockaddr*>(spec.dest_sa);
+        hdr.msg_namelen    = spec.dest_sa->sa_family == AF_INET
+                                 ? sizeof(struct sockaddr_in)
+                                 : sizeof(struct sockaddr_in6);
+        hdr.msg_iov        = const_cast<struct iovec*>(spec.iov);
+        hdr.msg_iovlen     = spec.iovlen;
+        // msg_control, msg_controllen left as 0 — no ancillary data
 
-        // Synchronous send — QUIC engine expects data to be on the wire
-        // before the callback returns.  UDP send_to is non-blocking in
-        // practice (just copies to kernel buffer).
-        for (unsigned j = 0; j < spec.iovlen; ++j) {
-            // Use raw sendto to rule out asio issues.
-            ssize_t n = sendto(listener->raw_fd_,
-                               spec.iov[j].iov_base,
-                               spec.iov[j].iov_len,
-                               0,
-                               spec.dest_sa,
-                               spec.dest_sa->sa_family == AF_INET
-                                   ? sizeof(struct sockaddr_in)
-                                   : sizeof(struct sockaddr_in6));
-            if (n < 0) {
-                spdlog::debug("QUIC sendto failed: {} (errno={})",
-                              strerror(errno), errno);
+        ssize_t n = sendmsg(listener->raw_fd_, &hdr, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // UDP send buffer is full.  lsquic keeps the unsent packets
+                // and expects us to call lsquic_engine_send_unsent_packets()
+                // once the socket drains — otherwise those packets sit
+                // forever and the connection stalls/expires.
+                spdlog::debug("QUIC sendmsg would block — will retry on writable");
+                listener->arm_send_retry();
             } else {
-                ++sent;
+                spdlog::debug("QUIC sendmsg failed: {} (errno={})",
+                              strerror(errno), errno);
             }
+        } else {
+            ++sent;
         }
     }
 
     return sent;  // tell lsquic how many packets were actually sent
 }
 
+void QuicTransportListener::arm_send_retry() {
+    if (send_retry_armed_ || !socket_.is_open())
+        return;
+    send_retry_armed_ = true;
+    socket_.async_wait(
+        asio::ip::udp::socket::wait_write,
+        [this](asio::error_code ec) {
+            send_retry_armed_ = false;
+            if (ec)
+                return;
+            // Socket drained — flush whatever lsquic has queued up.
+            if (engine_)
+                lsquic_engine_send_unsent_packets(engine_);
+            // If the flush itself hit EAGAIN again, re-arm for the next
+            // writable edge.
+            if (engine_ && lsquic_engine_has_unsent_packets(engine_))
+                arm_send_retry();
+        });
+}
+
 // ── Lookup helpers ────────────────────────────────────────
+
+QuicTransportSessionPtr
+QuicTransportListener::take_session(lsquic_conn_ctx_t* key) {
+    auto it = sessions_.find(key);
+    if (it == sessions_.end())
+        return nullptr;
+    auto session = it->second; // copy before erase keeps it alive for caller
+    sessions_.erase(it);
+    return session;
+}
 
 QuicTransportSession*
 QuicTransportListener::find_session(lsquic_conn_t* conn) {
@@ -568,7 +693,7 @@ void QuicTransportListener::load_tls_cert() {
     SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
 
-    // ALPN callback for QUIC protocol negotiation (QUIC requires ALPN).
+    // ALPN callback for H3 negotiation.
     SSL_CTX_set_alpn_select_cb(ssl_ctx_, select_alpn_cb, nullptr);
     spdlog::debug("QUIC ALPN callback set (h3, h3-29)");
 
