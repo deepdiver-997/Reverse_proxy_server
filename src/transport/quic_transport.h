@@ -5,13 +5,31 @@
 extern "C" {
 #include <lsquic.h>
 }
+#include <lsxpack_header.h>
 #include <asio.hpp>
 #include <functional>
 #include <memory>
 #include <queue>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ebpf_quic_proxy {
+
+// ── QuicH3HeaderSet ───────────────────────────────────────
+
+/// Per-request HTTP/3 header set allocated by the HSI (`hsi_create_header_set`)
+/// and filled by lsquic's QPACK decoder via `hsi_prepare_decode` /
+/// `hsi_process_header`.  Handed back to us by `lsquic_stream_get_hset()`.
+struct QuicH3HeaderSet {
+    std::array<char, 64 * 1024> decode_buf{};   // lsxpack decoder buffer
+    std::vector<std::pair<std::string, std::string>> headers; // name, value
+    std::string method, path, authority, scheme;
+    int status_code = 0;
+    struct lsxpack_header xhdr {};
+    std::size_t decode_off = 0;
+    bool have_xhdr = false;
+};
 
 // ── QuicTransportStream ───────────────────────────────────
 
@@ -48,6 +66,15 @@ public:
     void adopt_self() { self_ = shared_from_this(); }
     void release_self() { self_.reset(); }
 
+    // HTTP/3 (lsquic native, ADR-8): request the lsquic-decoded header set as
+    // an IR head. Must be called before reading the body. Returns false if
+    // unsupported or a take is already pending.
+    bool async_take_headers(HeadersCallback cb) override;
+
+    // HTTP/3: send a header block via lsquic_stream_send_headers before the
+    // body. Pseudo-headers (e.g. ":status") must be first.
+    bool async_send_headers(const HeaderList& headers, WriteCallback cb) override;
+
 private:
     lsquic_stream_t* stream_;
     std::string id_;
@@ -55,6 +82,12 @@ private:
     // Pending read callback.
     ReadCallback read_cb_;
     asio::mutable_buffer read_buf_{};
+
+    // HTTP/3: pending "give me the decoded request headers" callback.
+    HeadersCallback headers_cb_;
+
+    // Try to claim the decoded H3 header set; fires headers_cb_ when ready.
+    void try_take_headers();
 
     // Pending write callback + queue.
     // `offset` tracks how much of `data` has already been handed to lsquic:
@@ -189,6 +222,15 @@ private:
     static int on_packets_out_cb(void* self,
                                  const lsquic_out_spec* specs,
                                  unsigned count);
+
+    // ── HTTP/3 header-set interface (HSI, ADR-8) ──────────
+    static void* hsi_create(void* ctx, lsquic_stream_t* stream,
+                            int is_push_promise);
+    static struct lsxpack_header* hsi_prepare_decode(void* hset,
+                                                     struct lsxpack_header* hdr,
+                                                     size_t space);
+    static int hsi_process(void* hset, struct lsxpack_header* hdr);
+    static void hsi_discard(void* hset);
 
     // Lookup helpers.
     QuicTransportSession* find_session(lsquic_conn_t* conn);

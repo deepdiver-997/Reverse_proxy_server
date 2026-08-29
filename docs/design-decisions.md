@@ -78,7 +78,11 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 - QPACK（RFC 9204）与 HPACK 同量级复杂度（动态表/静态表/Huffman/blocked stream），手写正确且互操作 = 数周工作量 + 大正确性风险，demo 不值得。
 - 现状 `H3Codec` 的 literal-headers（无 QPACK）**不可与真实客户端互操作**——浏览器 / `curl --http3` 发的是 QPACK 压缩头。
 - "减少依赖"不成立：QUIC 层本就依赖 lsquic；路线 A 只是换成自写 QPACK（或 vendoring lshpack/nghttp3 的更多胶水）。
-**待办**：实现完整 HSI；`H3Codec` 改为坐在 lsquic 原生 H3 之上（parse 走 `get_hset`、serialize 走 `send_headers`）；移除假 HSI 与手写帧解析的混搭。
+**实现状态（已完成核心）**：
+- `QuicTransportListener` 的 HSI 已实现（`QuicH3HeaderSet`：QPACK 解码缓冲 + 头部收集，`hsi_create/prepare_decode/process/discard`），假 HSI 已移除。
+- `QuicTransportStream` 新增 `async_take_headers`（`lsquic_stream_get_hset` 认领解码头 → IR）与 `async_send_headers`（`lsquic_stream_send_headers`），`on_readable` 优先投递解码头。
+- `H3Codec::async_parse_request` 走 transport 解码头 → IR，body 为 DATA 读到 FIN；`async_write_response` 走 `send_headers` + body 泵。手写帧解析状态机已移除（varint + `h3_detail::parse_request_headers` 工具保留，仍有单测）。
+- **未接**：H3 上游（`async_parse_response`/`async_write_request`）——后端仍是 HTTP/1.1，这两个保持 `operation_not_supported` 占位。
 
 ## 开放问题（需要决策）
 
@@ -86,9 +90,9 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 
 已决策：**路线 B（lsquic 原生 H3）**，理由与实现待办见 [ADR-8](#adr-8http3-头处理走-lsquic-原生路线-b)。原"手写 vs 原生"二选一已关闭；剩余是 ADR-8 里的实现待办。
 
-### ② 响应路径绕过 codec
+### ② 响应路径绕过 codec ✅ 已解决
 
-`ProxyCore::forward_request` 把上游的 HTTP/1.1 字节直接写回客户端流，`H3Codec::async_write_response` 从未被调用。TCP 成立，H3 下响应缺 HEADERS 帧。应在响应方向也接 codec（至少为 H3 客户端）。
+`RelaySession`（ADR-7）让响应方向走 codec：后端 codec 解析响应 → 客户端 codec 写回。H1 响应（CL/chunked/close-delimited）已实现；H3 响应走 `H3Codec::async_write_response` → `lsquic_stream_send_headers` + DATA body（ADR-8）。
 
 ### ③ 上游连接复用（keep-alive pool）
 

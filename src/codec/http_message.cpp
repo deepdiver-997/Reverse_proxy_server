@@ -1,6 +1,7 @@
 #include "http_message.h"
 #include "transport/itransport_stream.h"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <sstream>
 
@@ -105,6 +106,58 @@ void BufferBodySource::async_read_some(asio::mutable_buffer buf,
 
 std::optional<std::size_t> BufferBodySource::content_length() const {
     return data_.size();
+}
+
+// ── StreamEofBodySource ───────────────────────────────────
+
+StreamEofBodySource::StreamEofBodySource(ITransportStreamPtr stream)
+    : stream_(std::move(stream)) {}
+
+void StreamEofBodySource::async_read_some(asio::mutable_buffer buf,
+                                          ReadCallback cb) {
+    auto self = shared_from_this();
+    stream_->async_read_some(
+        buf, [self, cb = std::move(cb)](asio::error_code ec, std::size_t n) {
+            if (ec == asio::error::eof)
+                cb({}, 0); // EOF = end of body
+            else if (ec)
+                cb(ec, 0);
+            else
+                cb({}, n);
+        });
+}
+
+std::optional<std::size_t> StreamEofBodySource::content_length() const {
+    return std::nullopt;
+}
+
+// ── pump_body_to_stream ───────────────────────────────────
+
+void pump_body_to_stream(ITransportStreamPtr stream, BodySourcePtr body,
+                         std::function<void(asio::error_code)> cb) {
+    auto pump = std::make_shared<std::function<void()>>();
+    auto buf = std::make_shared<std::array<char, 8192>>();
+    *pump = [stream, body, cb, pump, buf]() mutable {
+        body->async_read_some(
+            asio::buffer(*buf),
+            [stream, body, cb, pump, buf](asio::error_code ec,
+                                          std::size_t n) mutable {
+                if (ec || n == 0) {
+                    cb(ec);
+                    return;
+                }
+                stream->async_write_some(
+                    asio::buffer(buf->data(), n),
+                    [pump, cb](asio::error_code ec, std::size_t) mutable {
+                        if (ec) {
+                            cb(ec);
+                            return;
+                        }
+                        (*pump)();
+                    });
+            });
+    };
+    (*pump)();
 }
 
 // ── HttpStatus helpers ────────────────────────────────────

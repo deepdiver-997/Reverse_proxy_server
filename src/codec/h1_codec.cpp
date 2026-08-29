@@ -148,61 +148,6 @@ private:
     bool finished_ = false;
 };
 
-/// Body until the connection closes (responses with no Content-Length/chunked).
-class CloseDelimitedBodySource final : public BodySource,
-                                       public std::enable_shared_from_this<CloseDelimitedBodySource> {
-public:
-    explicit CloseDelimitedBodySource(ITransportStreamPtr stream)
-        : stream_(std::move(stream)) {}
-
-    void async_read_some(asio::mutable_buffer buf, ReadCallback cb) override {
-        auto self = shared_from_this();
-        stream_->async_read_some(
-            buf, [self, cb](asio::error_code ec, std::size_t n) {
-                if (ec == asio::error::eof)
-                    cb({}, 0); // EOF = end of body
-                else if (ec)
-                    cb(ec, 0);
-                else
-                    cb({}, n);
-            });
-    }
-
-    std::optional<std::size_t> content_length() const override {
-        return std::nullopt;
-    }
-
-private:
-    ITransportStreamPtr stream_;
-};
-
-// Shared pump: recursively forward body bytes into `stream` until exhausted.
-void pump_body(ITransportStreamPtr stream, BodySourcePtr body,
-               ICodec::WriteCallback cb) {
-    auto pump = std::make_shared<std::function<void()>>();
-    auto buf = std::make_shared<std::array<char, 8192>>();
-    *pump = [stream, body, cb, pump, buf]() mutable {
-        body->async_read_some(
-            asio::buffer(*buf),
-            [stream, body, cb, pump, buf](asio::error_code ec, std::size_t n) mutable {
-                if (ec || n == 0) {
-                    cb(ec);
-                    return;
-                }
-                stream->async_write_some(
-                    asio::buffer(buf->data(), n),
-                    [pump, cb](asio::error_code ec, std::size_t) mutable {
-                        if (ec) {
-                            cb(ec);
-                            return;
-                        }
-                        (*pump)();
-                    });
-            });
-    };
-    (*pump)();
-}
-
 } // namespace
 
 
@@ -417,7 +362,7 @@ void H1Codec::read_response_header(ITransportStreamPtr stream,
                         stream, remaining);
                 }
             } else {
-                body_src = std::make_shared<CloseDelimitedBodySource>(stream);
+                body_src = std::make_shared<StreamEofBodySource>(stream);
             }
 
             cb({}, std::move(head), std::move(body_src));
@@ -489,7 +434,7 @@ void H1Codec::async_write_request(ITransportStreamPtr stream,
                 cb(ec);
                 return;
             }
-            pump_body(std::move(stream), std::move(body), std::move(cb));
+            pump_body_to_stream(std::move(stream), std::move(body), std::move(cb));
         });
 }
 
@@ -510,7 +455,7 @@ void H1Codec::async_write_response(ITransportStreamPtr stream,
                 cb(ec);
                 return;
             }
-            pump_body(std::move(stream), std::move(body), std::move(cb));
+            pump_body_to_stream(std::move(stream), std::move(body), std::move(cb));
         });
 }
 

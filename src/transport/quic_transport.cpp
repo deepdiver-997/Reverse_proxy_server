@@ -1,10 +1,12 @@
 #include "quic_transport.h"
+#include "codec/http_message.h"
 extern "C" {
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 }
 #include <spdlog/spdlog.h>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -67,6 +69,12 @@ void QuicTransportStream::async_shutdown(ShutdownCallback cb) {
 std::string QuicTransportStream::stream_id() const { return id_; }
 
 void QuicTransportStream::on_readable() {
+    // HTTP/3 (ADR-8): a pending header take has priority — the decoded header
+    // set must be claimed (lsquic_stream_get_hset) before any body read.
+    if (headers_cb_) {
+        try_take_headers();
+        return;
+    }
     if (!read_cb_)
         return;
 
@@ -94,6 +102,86 @@ void QuicTransportStream::on_readable() {
         else
             cb(asio::error::eof, 0);
     }
+}
+
+bool QuicTransportStream::async_take_headers(HeadersCallback cb) {
+    if (!stream_ || headers_cb_)
+        return false;
+    headers_cb_ = std::move(cb);
+    lsquic_stream_wantread(stream_, 1);
+    try_take_headers(); // headers may already be decoded
+    return true;
+}
+
+void QuicTransportStream::try_take_headers() {
+    if (!headers_cb_ || !stream_)
+        return;
+    void* hset = lsquic_stream_get_hset(stream_);
+    if (!hset)
+        return; // not decoded yet — on_read will fire again
+    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
+
+    // Convert the decoded H3 header set to the protocol-independent IR.
+    HttpRequestHead head;
+    head.method = std::move(hs->method);
+    head.path   = std::move(hs->path);
+    // Map :authority → host so Host-based routing works uniformly with H1.
+    if (!hs->authority.empty())
+        head.headers.set("host", std::move(hs->authority));
+    for (auto& [k, v] : hs->headers)
+        head.headers.add(std::move(k), std::move(v));
+    if (auto cl = head.headers.get("content-length")) {
+        char* end = nullptr;
+        head.content_length = std::strtoul(cl->c_str(), &end, 10);
+    }
+    delete hs;
+
+    auto cb = std::move(headers_cb_);
+    headers_cb_ = nullptr;
+    cb({}, std::move(head));
+}
+
+bool QuicTransportStream::async_send_headers(const HeaderList& headers,
+                                             WriteCallback cb) {
+    if (!stream_) {
+        cb(asio::error::eof, 0);
+        return false;
+    }
+    std::size_t total = 0;
+    for (const auto& [k, v] : headers)
+        total += k.size() + v.size();
+    if (total > 64 * 1024) { // lsxpack limits a header block to 64 KB
+        spdlog::warn("QUIC: header block too large ({} bytes)", total);
+        cb(asio::error::message_size, 0);
+        return true;
+    }
+
+    // Build name/value bytes + lsxpack_header array pointing into them.
+    std::vector<char> name_vals;
+    name_vals.reserve(total);
+    std::vector<lsxpack_header> arr(headers.empty() ? 1 : headers.size());
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        const auto& [k, v] = headers[i];
+        name_vals.insert(name_vals.end(), k.begin(), k.end());
+        name_vals.insert(name_vals.end(), v.begin(), v.end());
+        lsxpack_header_set_offset2(&arr[i], name_vals.data(), off, k.size(),
+                                   off + k.size(), v.size());
+        off += k.size() + v.size();
+    }
+
+    lsquic_http_headers_t hs = {
+        .count   = static_cast<int>(headers.size()),
+        .headers = arr.data(),
+    };
+    // send_headers encodes synchronously into the stream; the arrays only
+    // need to outlive this call.
+    int r = lsquic_stream_send_headers(stream_, &hs, 0);
+    if (r == 0)
+        cb({}, 0);
+    else
+        cb(asio::error::eof, 0);
+    return true;
 }
 
 void QuicTransportStream::on_writeable() {
@@ -198,6 +286,61 @@ void QuicTransportStream::pump_write() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// HTTP/3 header-set interface (HSI, ADR-8)
+// ═══════════════════════════════════════════════════════════
+
+void* QuicTransportListener::hsi_create(void*, lsquic_stream_t*, int) {
+    return new QuicH3HeaderSet();
+}
+
+struct lsxpack_header*
+QuicTransportListener::hsi_prepare_decode(void* hset, struct lsxpack_header* hdr,
+                                          size_t space) {
+    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
+    if (hdr) {
+        // We don't grow the decode buffer — fail the decode.
+        return nullptr;
+    }
+    if (hs->have_xhdr)
+        hs->decode_off += lsxpack_header_get_dec_size(&hs->xhdr);
+    else
+        hs->have_xhdr = true;
+    if (hs->decode_off + space > hs->decode_buf.size()) {
+        spdlog::warn("QUIC HSI: decode buffer too small (need {}, have {})",
+                     space, hs->decode_buf.size() - hs->decode_off);
+        return nullptr;
+    }
+    lsxpack_header_prepare_decode(&hs->xhdr, hs->decode_buf.data(),
+                                  hs->decode_off,
+                                  hs->decode_buf.size() - hs->decode_off);
+    return &hs->xhdr;
+}
+
+int QuicTransportListener::hsi_process(void* hset, struct lsxpack_header* hdr) {
+    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
+    if (!hdr)
+        return 0; // header set complete
+    const char* name = lsxpack_header_get_name(hdr);
+    const char* value = lsxpack_header_get_value(hdr);
+    if (!name || !value)
+        return -1;
+    std::string n(name, hdr->name_len);
+    std::string v(value, hdr->val_len);
+    if (n == ":method")      hs->method = std::move(v);
+    else if (n == ":path")   hs->path = std::move(v);
+    else if (n == ":authority") hs->authority = std::move(v);
+    else if (n == ":scheme") hs->scheme = std::move(v);
+    else if (n == ":status") hs->status_code =
+                                 static_cast<int>(std::strtoul(v.c_str(), nullptr, 10));
+    else                     hs->headers.emplace_back(std::move(n), std::move(v));
+    return 0;
+}
+
+void QuicTransportListener::hsi_discard(void* hset) {
+    delete static_cast<QuicH3HeaderSet*>(hset);
+}
+
+// ═══════════════════════════════════════════════════════════
 // QuicTransportSession
 // ═══════════════════════════════════════════════════════════
 
@@ -296,26 +439,15 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
         .on_reset       = on_reset_cb,
     };
 
-    // HSI interface — lsquic uses this to decode H3 headers.
-    // We provide the very minimum to keep lsquic's H3 processing happy;
-    // actual header data is read separately through the stream.
+    // HSI interface (ADR-8, route B): lsquic decodes QPACK request headers
+    // into a QuicH3HeaderSet we allocate; the stream later claims it via
+    // lsquic_stream_get_hset() (see QuicTransportStream::try_take_headers).
     static const struct lsquic_hset_if kHsiIf = {
-        .hsi_create_header_set = +[](void *, lsquic_stream_t *, int) -> void* {
-            return malloc(1);
-        },
-        .hsi_prepare_decode = +[](void *, struct lsxpack_header *, size_t)
-                                -> struct lsxpack_header* {
-            // Return nullptr — we don't decode headers here.
-            // lsquic will skip QPACK decode and just pass raw stream data.
-            return nullptr;
-        },
-        .hsi_process_header = +[](void *, struct lsxpack_header *) -> int {
-            return 0;
-        },
-        .hsi_discard_header_set = +[](void *hdr_set) {
-            free(hdr_set);
-        },
-        .hsi_flags = (enum lsquic_hsi_flag)0,
+        .hsi_create_header_set  = QuicTransportListener::hsi_create,
+        .hsi_prepare_decode     = QuicTransportListener::hsi_prepare_decode,
+        .hsi_process_header     = QuicTransportListener::hsi_process,
+        .hsi_discard_header_set = QuicTransportListener::hsi_discard,
+        .hsi_flags              = (enum lsquic_hsi_flag)0,
     };
 
     struct lsquic_engine_api api = {};

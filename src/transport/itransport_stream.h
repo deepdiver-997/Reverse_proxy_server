@@ -4,8 +4,12 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ebpf_quic_proxy {
+
+struct HttpRequestHead; // fwd — codec IR, used only in callback signatures
 
 /// Single bidirectional byte-stream (ordered, reliable).
 /// TCP: 1 connection = 1 stream.
@@ -18,6 +22,14 @@ public:
         std::function<void(asio::error_code, std::size_t)>;
     using ShutdownCallback =
         std::function<void(asio::error_code)>;
+
+    /// Result of taking internally-decoded request headers (HTTP/3).
+    using HeadersCallback =
+        std::function<void(asio::error_code, HttpRequestHead)>;
+
+    /// Ordered list of (name, value) header pairs for HTTP/3 send_headers
+    /// (pseudo-headers first, e.g. ":status").
+    using HeaderList = std::vector<std::pair<std::string, std::string>>;
 
     virtual ~ITransportStream() = default;
 
@@ -34,6 +46,20 @@ public:
 
     /// Opaque id for logging / tracing.
     virtual std::string stream_id() const = 0;
+
+    /// Optional (HTTP/3): transports that decode request headers internally
+    /// (lsquic QPACK) expose them here. `cb` fires with the request IR when
+    /// the decoded header set is ready, or with an error. Must be called
+    /// before any body read. Base implementation reports "not supported".
+    /// Returns false when the transport does not provide decoded headers
+    /// (e.g. raw TCP) or a take is already pending.
+    virtual bool async_take_headers(HeadersCallback /*cb*/) { return false; }
+
+    /// Optional (HTTP/3): send a header block (lsquic_stream_send_headers)
+    /// before writing the body. Pseudo-headers such as ":status" must be the
+    /// first entries. Base implementation reports "not supported".
+    virtual bool async_send_headers(const HeaderList& /*headers*/,
+                                    WriteCallback /*cb*/) { return false; }
 };
 
 using ITransportStreamPtr = std::shared_ptr<ITransportStream>;

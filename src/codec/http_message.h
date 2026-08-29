@@ -129,4 +129,26 @@ private:
     std::size_t read_pos_ = 0;
 };
 
+/// BodySource that reads from an ITransportStream until EOF (length unknown).
+/// Used for HTTP/1.1 close-delimited bodies and HTTP/3 DATA payloads
+/// (which end at stream FIN).
+class StreamEofBodySource final
+    : public BodySource,
+      public std::enable_shared_from_this<StreamEofBodySource> {
+public:
+    explicit StreamEofBodySource(ITransportStreamPtr stream);
+
+    void async_read_some(asio::mutable_buffer buf,
+                         ReadCallback cb) override;
+    std::optional<std::size_t> content_length() const override;
+
+private:
+    ITransportStreamPtr stream_;
+};
+
+/// Pump a BodySource into a stream until exhausted; `cb(ec)` when done.
+/// Shared by the H1/H3 codecs' write paths.
+void pump_body_to_stream(ITransportStreamPtr stream, BodySourcePtr body,
+                         std::function<void(asio::error_code)> cb);
+
 } // namespace ebpf_quic_proxy

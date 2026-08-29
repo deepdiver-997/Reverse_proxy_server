@@ -5,7 +5,6 @@
 #include <asio.hpp>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace ebpf_quic_proxy {
 
@@ -40,11 +39,14 @@ enum class H3FrameType : uint64_t {
 
 // ── H3 Codec ─────────────────────────────────────────────
 
-/// Minimal HTTP/3 codec.
+/// HTTP/3 codec on top of lsquic's native H3 (ADR-8, route B).
 ///
-/// Parses HEADERS + optional DATA frames from a QUIC stream into
-/// the protocol-independent IR.  QPACK is NOT implemented —
-/// responses use literal headers (name/value in the HEADERS frame).
+/// Header handling is delegated to the transport: request headers are decoded
+/// by lsquic's QPACK into a header set, claimed via
+/// ITransportStream::async_take_headers(), and mapped to the IR; response
+/// headers go out via ITransportStream::async_send_headers()
+/// (lsquic_stream_send_headers).  Bodies are raw DATA payloads — read/write
+/// via the ordinary stream byte interface.
 ///
 /// Implements the same ICodec interface as H1Codec, so ProxyCore
 /// can swap them based on the listener that produced the stream.
@@ -65,36 +67,6 @@ public:
                               HttpResponseHead head,
                               BodySourcePtr body,
                               WriteCallback cb) override;
-
-private:
-    // ── Parsing state ───────────────────────────────────
-    enum class ParseState {
-        ExpectHeaders,
-        ReadingHeaders,
-        ExpectData,
-        ReadingData,
-        Done,
-    };
-
-    struct ParseCtx {
-        ITransportStreamPtr stream;
-        ParseCallback cb;
-        ParseState state = ParseState::ExpectHeaders;
-        std::vector<uint8_t> buf; // accumulated bytes
-        std::size_t frame_bytes_needed = 0;
-        H3FrameType current_frame_type = H3FrameType::DATA;
-        std::size_t headers_content_offset = 0;
-        std::size_t headers_content_len = 0;
-        std::optional<std::size_t> content_length;
-        std::string method;
-        std::string path;
-        HeaderMap hdrs;
-    };
-
-    void parse_loop(std::shared_ptr<ParseCtx> ctx);
-    void on_frame_header(std::shared_ptr<ParseCtx> ctx);
-    void on_frame_payload(std::shared_ptr<ParseCtx> ctx);
-    void build_request_ir(std::shared_ptr<ParseCtx> ctx);
 };
 
 /// Standalone helpers — exposed for unit testing.
