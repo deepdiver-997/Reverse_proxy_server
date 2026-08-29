@@ -36,6 +36,18 @@ public:
     void on_close();
     void on_reset(int how); // how: 0=read, 1=write, 2=both (shutdown(2) style)
 
+    // Self-ownership — same pattern as QuicTransportSession: the wrapper
+    // holds a shared_ptr to itself so it lives exactly as long as the
+    // underlying lsquic stream (deterministic, independent of whether the
+    // app retained a reference).
+    //   adopt_self()  — called by QuicTransportSession::on_new_stream after
+    //                   make_shared.
+    //   release_self()— called at the end of on_close(); on_close_cb holds a
+    //                   keep-alive copy so destruction happens after the
+    //                   last lsquic callback for the stream returns.
+    void adopt_self() { self_ = shared_from_this(); }
+    void release_self() { self_.reset(); }
+
 private:
     lsquic_stream_t* stream_;
     std::string id_;
@@ -58,6 +70,8 @@ private:
 
     // Pending shutdown callback.
     ShutdownCallback shutdown_cb_;
+
+    std::shared_ptr<QuicTransportStream> self_; // cyclic self-ownership
 
     void pump_write();
 };

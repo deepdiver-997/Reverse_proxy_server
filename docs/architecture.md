@@ -80,4 +80,4 @@ QUIC 侧每一层的事件都由 lsquic 回调驱动，全程同步发生在**�
 
 - `QuicTransportSession` **自持**一份 `shared_ptr`（`self_`，`on_new_conn` 里 `adopt_self()`）——刻意可破的循环，保证对象活到连接结束，无需 listener 维护注册表。
 - 连接关闭时 `on_conn_closed_cb`（lsquic 对该连接的最后一次回调）先 `shared_from_this()` 取保活拷贝、再 `on_closed()`、最后 `release_self()` 释放自持；析构发生在该回调返回之后（避免在成员函数内销毁 `this`，且此时 lsquic 已不再引用 conn）。
-- `QuicTransportStream` 的 ctx（`lsquic_stream_ctx_t*`）即 stream 对象自身，在构造时 `lsquic_stream_set_ctx` 设置；`on_close` 置 `stream_=nullptr`，析构时据此跳过对已释放 lsquic stream 的访问。
+- `QuicTransportStream` 与 session **同样自持**（`adopt_self()`/`release_self()`）：ctx 即 wrapper 自身；`on_close` 置 `stream_=nullptr`、发 EOF 回调、`release_self()`；`on_close_cb` 先取保活拷贝，析构发生在最后一次流回调返回后。

@@ -72,6 +72,7 @@ lsquic 引擎**没有**自己的线程、socket、定时器。它只是一台状
 ## 6. 健壮性要点（含近期修复）
 
 - `on_conn_closed_cb` 是连接的最后一次回调：先 `shared_from_this()` 拿保活拷贝 → `on_closed()` → `release_self()` 释放自持，析构发生在回调返回后（避免在成员函数内销毁 `this`，也避免 lsquic 之后还引用悬垂 ctx）。
+- `QuicTransportStream` 与 session **同样自持**（`adopt_self()`/`release_self()`）：`on_close` 先置 `stream_=nullptr` 再发 EOF 回调（防回调重入摸 lsquic），最后 `release_self()`；`on_close_cb` 先拿 `shared_from_this()` 保活。`async_read_some` 对已关闭流直接回 EOF。
 - UDP 收包错误后要重新 `do_recv()`（瞬时错误不能杀死整个监听循环）；`operation_aborted` 表示关闭，不再 re-arm。
 - `on_packets_out` 遇 `EAGAIN/EWOULDBLOCK`：保留未发包，等 socket 可写（`socket_.async_wait(wait_write)`）再调 `lsquic_engine_send_unsent_packets()`，否则那些包永久滞留、连接最终超时。
 - `on_reset`（对端 RST 流）要及时解阻塞挂起的读写回调，避免一直等到超时。

@@ -31,6 +31,12 @@ QuicTransportStream::~QuicTransportStream() {
 
 void QuicTransportStream::async_read_some(asio::mutable_buffer buf,
                                            ReadCallback cb) {
+    // Stream may already be closed (on_close fired) — fail fast rather than
+    // deref the nulled handle.
+    if (!stream_) {
+        cb(asio::error::eof, 0);
+        return;
+    }
     read_buf_ = buf;
     read_cb_ = std::move(cb);
     lsquic_stream_wantread(stream_, 1);
@@ -96,7 +102,10 @@ void QuicTransportStream::on_writeable() {
 }
 
 void QuicTransportStream::on_close() {
-    // Fire pending callbacks with errors so they don't hang.
+    // Null the handle first: any async op re-entered from the EOF callbacks
+    // below sees a closed stream and flushes immediately instead of touching
+    // lsquic on a stream it is tearing down.
+    stream_ = nullptr;
     if (read_cb_) {
         auto cb = std::move(read_cb_);
         cb(asio::error::eof, 0);
@@ -111,7 +120,10 @@ void QuicTransportStream::on_close() {
         cb({});
     }
     writing_ = false;
-    stream_ = nullptr;
+    // Drop self-ownership.  The caller (on_close_cb) holds a keep-alive copy,
+    // so the wrapper is destroyed only after this callback returns — which is
+    // exactly when lsquic finishes with the stream.
+    release_self();
 }
 
 void QuicTransportStream::on_reset(int how) {
@@ -233,6 +245,7 @@ std::string QuicTransportSession::remote_addr() const { return remote_addr_; }
 void QuicTransportSession::on_new_stream(lsquic_stream_t* lsquic_stream) {
     if (new_stream_cb_) {
         auto stream = std::make_shared<QuicTransportStream>(lsquic_stream);
+        stream->adopt_self(); // same self-ownership as the session
         new_stream_cb_(std::move(stream));
     }
 }
@@ -535,8 +548,12 @@ void QuicTransportListener::on_write_cb(lsquic_stream_t* stream,
 void QuicTransportListener::on_close_cb(lsquic_stream_t* stream,
                                          lsquic_stream_ctx_t* ctx) {
     auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
-    if (qstream)
-        qstream->on_close();
+    if (!qstream)
+        return;
+    // on_close() releases the stream's self-reference; keep a copy so the
+    // wrapper is not destroyed while still inside its own member function.
+    auto keep_alive = qstream->shared_from_this();
+    qstream->on_close();
 }
 
 void QuicTransportListener::on_reset_cb(lsquic_stream_t* stream,
