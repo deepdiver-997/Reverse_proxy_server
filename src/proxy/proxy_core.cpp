@@ -7,26 +7,6 @@
 
 namespace ebpf_quic_proxy {
 
-namespace {
-
-// Write an error response to `stream` through `codec`, then shut it down.
-// Goes through the codec so the response is correctly framed for the client's
-// protocol (H1 or H3).
-void write_error(ICodec* codec, ITransportStreamPtr stream, HttpStatus status,
-                 const std::string& msg) {
-    HttpResponseHead resp;
-    resp.status_code = static_cast<int>(status);
-    resp.reason = status_reason(status);
-    resp.headers.set("content-type", "text/plain");
-    resp.headers.set("content-length", std::to_string(msg.size()));
-    codec->async_write_response(
-        std::move(stream), std::move(resp),
-        std::make_shared<BufferBodySource>(msg),
-        [](asio::error_code) {});
-}
-
-} // namespace
-
 
 ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     : io_(io),
@@ -102,63 +82,12 @@ void ProxyCore::on_session(ITransportSessionPtr session) {
 void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     spdlog::debug("new stream {}", stream->stream_id());
 
-    // Parse the request.
-    codec->async_parse_request(
-        stream, [this, stream, codec](asio::error_code ec,
-                                      HttpRequestHead head,
-                                      BodySourcePtr body) mutable {
-            if (ec) {
-                spdlog::debug("parse error on {}: {}", stream->stream_id(),
-                              ec.message());
-                return;
-            }
-
-            spdlog::info("{} {} {} from {}", head.method, head.path,
-                         head.headers.get("host").value_or("-"),
-                         stream->stream_id());
-
-            // Route.
-            auto backend_id = router_.route(head);
-            if (backend_id.empty()) {
-                spdlog::warn("no route for host={}",
-                             head.headers.get("host").value_or("-"));
-                write_error(codec, stream, HttpStatus::ServiceUnavailable,
-                            "no route for host\n");
-                return;
-            }
-
-            forward_request(std::move(stream), codec, std::move(head),
-                            std::move(body), std::move(backend_id));
-        });
-}
-
-void ProxyCore::forward_request(ITransportStreamPtr client_stream,
-                                ICodec* client_codec, HttpRequestHead head,
-                                BodySourcePtr body,
-                                const std::string& backend_id) {
-    upstream_pool_.async_connect(
-        backend_id,
-        [this, client_stream, client_codec, head = std::move(head),
-         body = std::move(body),
-         backend_id](asio::error_code ec,
-                     ITransportStreamPtr upstream_stream) mutable {
-            if (ec) {
-                spdlog::warn("upstream connect failed: {}", ec.message());
-                write_error(client_codec, std::move(client_stream),
-                            HttpStatus::BadGateway, "upstream unreachable\n");
-                return;
-            }
-
-            // Both sides are now connected — hand off to a RelaySession which
-            // serializes the request to the backend (backend codec), parses the
-            // backend response, and serializes it back to the client (client
-            // codec).  Response direction now goes through the codec.
-            std::string method = head.method; // save before moving head
-            auto session = std::make_shared<RelaySession>(
-                std::move(client_stream), std::move(upstream_stream),
-                client_codec, h1_codec_.get());
-            session->forward(std::move(head), std::move(body), method);
-        });
+    // The RelaySession owns the rest of this client stream's lifecycle:
+    // parse request → route → connect backend → relay → loop (H1 keep-alive)
+    // or teardown.  It injects router + upstream pool + codecs.
+    auto session = std::make_shared<RelaySession>(
+        std::move(stream), codec, h1_codec_.get(), &router_, &upstream_pool_);
+    session->start();
 }
 
 } // namespace ebpf_quic_proxy

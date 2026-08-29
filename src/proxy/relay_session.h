@@ -1,41 +1,50 @@
 #pragma once
 
 #include "codec/icodec.h"
+#include "router.h"
 #include "transport/itransport_stream.h"
+#include "upstream_pool.h"
 #include <memory>
 #include <string>
 
 namespace ebpf_quic_proxy {
 
-/// Bridges one parsed client request to a backend and relays the response back
-/// to the client, both directions through codecs (ADR-7).
+/// Bridges a client stream and a per-request backend stream, relaying HTTP
+/// messages in a phase machine (ADR-7):
 ///
-/// Holds both streams as shared_ptr: the backend stream can later be returned
-/// to an upstream connection pool — the pool holds one ref while idle, the
-/// relay holds one while active, and releasing the relay's ref on teardown is
-/// exactly the "check-out / check-in" boundary.
+///   Request phase:  parse client request → route → connect backend → write
+///   Response phase: parse backend response → write to client
+///   after response: if client keep-alive (codec-reported) → back to Request,
+///                   else teardown
+///
+/// The keep-alive decision comes from the codec's parse callbacks (Connection
+/// header / HTTP version / body framing), not hard-coded per transport.
+/// Router + UpstreamPool are injected (owned by ProxyCore, outlive this).
 class RelaySession : public std::enable_shared_from_this<RelaySession> {
 public:
-    RelaySession(ITransportStreamPtr client, ITransportStreamPtr backend,
-                 ICodec* client_codec, ICodec* backend_codec);
+    RelaySession(ITransportStreamPtr client, ICodec* client_codec,
+                 ICodec* backend_codec, Router* router, UpstreamPool* pool);
 
-    /// Forward one already-parsed request and relay the response back.
-    /// `request_method` is used to suppress the body on HEAD responses
-    /// (a HEAD response's Content-Length is a "would-be" length — no body
-    /// follows on the wire, so reading it would hang).
-    void forward(HttpRequestHead head, BodySourcePtr body,
-                 const std::string& request_method);
+    /// Begin relaying (enters the Request phase).
+    void start();
 
 private:
+    void request_phase();
     void send_backend_request(HttpRequestHead head, BodySourcePtr body);
-    void relay_response();
+    void response_phase();
+    void close_backend();
+    void after_client_response();
+    void write_error(HttpStatus status, const std::string& msg);
     void teardown();
 
     ITransportStreamPtr client_;
     ITransportStreamPtr backend_;
     ICodec* client_codec_;  // owned by ProxyCore, outlives this
     ICodec* backend_codec_; // owned by ProxyCore, outlives this
+    Router* router_;
+    UpstreamPool* pool_;
     std::string request_method_;
+    bool client_keep_alive_ = false;
     bool done_ = false;
 };
 

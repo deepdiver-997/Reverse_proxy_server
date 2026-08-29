@@ -54,7 +54,7 @@
 - 正代：客户端给出目标（绝对 URI 或 `CONNECT host:port`）→ 解析目标直接连。
 选择完成后两者完全相同：建立连接 → 双向泵。
 **泵的粒度**：纯隧道（CONNECT / WebSocket / 裸 TCP）按字节泵、不经 codec；HTTP 若要改写头（Host/Via/X-Forwarded-For）需按消息粒度泵（解析 → 改写 → 转发），codec 参与。
-**现状**：`ProxyCore::forward_request` 是一次性的简化版（写请求 → 读一条响应 → 关）；RelaySession 是其通用化（持久、双向、可选消息级改写）。
+**现状（Step 1 已实现）**：RelaySession 为**相位机**（Request → 路由 + 连接后端 → Response → 按 codec 的 `keep_alive` 回环或关闭）。`ICodec` 解析回调带 `keep_alive` 标志——由内容决定（H1 按 Connection/版本/body 定界算；H3 流恒 false，连接在 session 层持续）。**客户端 H1 keep-alive 已通**；后端仍每请求新建连接（Step 2 连接池待做）。
 
 **RelaySession 骨架**：
 ```cpp
@@ -95,6 +95,8 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 `RelaySession`（ADR-7）让响应方向走 codec：后端 codec 解析响应 → 客户端 codec 写回。H1 响应（CL/chunked/close-delimited）已实现；H3 响应走 `H3Codec::async_write_response` → `lsquic_stream_send_headers` + DATA body（ADR-8）。
 
 ### ③ 上游连接复用（keep-alive pool）
+
+**Step 1 已完成**：客户端 H1 keep-alive（`RelaySession` 相位机按 `keep_alive` 回环）。**Step 2 待做**：`RelaySession::close_backend()` 目前每请求关闭后端连接，改为归还连接池。
 
 当前 `UpstreamPool::async_connect` 每个请求新开一条 TCP 连接（lazy、无池），高并发下重复 TCP+TLS 握手成本高。**建议后续支持复用**，考虑点：
 - **HTTP/1.1 keep-alive**：一条连接可顺序服务多个请求 → 需要「借用/归还」池，且要处理：响应定界（无 Content-Length 时）、陈旧连接回收、每 host 连接数上限、请求串行化（H1 一条连接同时只能一个在途请求）。

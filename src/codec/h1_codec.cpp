@@ -148,6 +148,35 @@ private:
     bool finished_ = false;
 };
 
+// ── keep_alive decision (RFC 9112 §9.3) ──────────────────
+
+// HTTP/1.0 keeps alive only with an explicit Connection: keep-alive;
+// HTTP/1.1+ keeps alive unless told otherwise.
+bool version_keeps_alive(const std::string& version) {
+    return version.rfind("HTTP/1.0", 0) != 0; // 1.1+ or unknown → keep alive
+}
+
+bool header_says_close(const HeaderMap& hdrs) {
+    if (auto c = hdrs.get("connection"))
+        return c->find("close") != std::string::npos;
+    return false;
+}
+
+bool header_says_keep_alive(const HeaderMap& hdrs) {
+    if (auto c = hdrs.get("connection"))
+        return c->find("keep-alive") != std::string::npos;
+    return false;
+}
+
+bool compute_keep_alive(const HeaderMap& hdrs, const std::string& version) {
+    bool ka = version_keeps_alive(version);
+    if (header_says_close(hdrs))
+        ka = false;
+    else if (header_says_keep_alive(hdrs))
+        ka = true;
+    return ka;
+}
+
 } // namespace
 
 
@@ -172,12 +201,12 @@ void H1Codec::read_header_block(ITransportStreamPtr stream,
          cb = std::move(cb), chunk](asio::error_code ec,
                                      std::size_t n) mutable {
             if (ec) {
-                cb(ec, {}, nullptr);
+                cb(ec, {}, nullptr, false);
                 return;
             }
             if (n == 0) {
                 // EOF before headers complete → client closed connection
-                cb(asio::error::eof, {}, nullptr);
+                cb(asio::error::eof, {}, nullptr, false);
                 return;
             }
 
@@ -198,9 +227,10 @@ void H1Codec::read_header_block(ITransportStreamPtr stream,
             std::string body_prefix(buf->data() + pos + 4,
                                      buf->size() - pos - 4);
 
-            auto [head, err] = parse_header_block(raw);
+            std::string version;
+            auto [head, err] = parse_header_block(raw, &version);
             if (!err.empty()) {
-                cb(asio::error::invalid_argument, {}, nullptr);
+                cb(asio::error::invalid_argument, {}, nullptr, false);
                 return;
             }
 
@@ -235,12 +265,13 @@ void H1Codec::read_header_block(ITransportStreamPtr stream,
                 // No Content-Length, no body.
             }
 
-            cb({}, std::move(head), std::move(body_src));
+            bool keep_alive = compute_keep_alive(head.headers, version);
+            cb({}, std::move(head), std::move(body_src), keep_alive);
         });
 }
 
 std::pair<HttpRequestHead, std::string>
-H1Codec::parse_header_block(const std::string& raw) {
+H1Codec::parse_header_block(const std::string& raw, std::string* version_out) {
     HttpRequestHead head;
     std::istringstream iss(raw);
     std::string line;
@@ -253,7 +284,10 @@ H1Codec::parse_header_block(const std::string& raw) {
         line.pop_back();
 
     std::istringstream rl(line);
-    rl >> head.method >> head.path;
+    std::string version;
+    rl >> head.method >> head.path >> version;
+    if (version_out)
+        *version_out = version;
     if (head.method.empty() || head.path.empty())
         return {{}, "bad request line: " + line};
 
@@ -304,11 +338,11 @@ void H1Codec::read_response_header(ITransportStreamPtr stream,
          cb = std::move(cb), chunk](asio::error_code ec,
                                     std::size_t n) mutable {
             if (ec) {
-                cb(ec, {}, nullptr);
+                cb(ec, {}, nullptr, false);
                 return;
             }
             if (n == 0) {
-                cb(asio::error::eof, {}, nullptr);
+                cb(asio::error::eof, {}, nullptr, false);
                 return;
             }
 
@@ -325,13 +359,15 @@ void H1Codec::read_response_header(ITransportStreamPtr stream,
             std::string body_prefix(buf->data() + pos + 4,
                                     buf->size() - pos - 4);
 
-            auto [head, err] = parse_response_block(raw_block);
+            std::string version;
+            auto [head, err] = parse_response_block(raw_block, &version);
             if (!err.empty()) {
-                cb(asio::error::invalid_argument, {}, nullptr);
+                cb(asio::error::invalid_argument, {}, nullptr, false);
                 return;
             }
 
             BodySourcePtr body_src;
+            bool close_delimited = false; // no CL/chunked → body ends at close
             // Status-determined no-body responses.
             if (head.status_code / 100 == 1 || head.status_code == 204 ||
                 head.status_code == 304) {
@@ -363,14 +399,18 @@ void H1Codec::read_response_header(ITransportStreamPtr stream,
                 }
             } else {
                 body_src = std::make_shared<StreamEofBodySource>(stream);
+                close_delimited = true;
             }
 
-            cb({}, std::move(head), std::move(body_src));
+            bool keep_alive = compute_keep_alive(head.headers, version);
+            if (close_delimited)
+                keep_alive = false; // body delimited by connection close
+            cb({}, std::move(head), std::move(body_src), keep_alive);
         });
 }
 
 std::pair<HttpResponseHead, std::string>
-H1Codec::parse_response_block(const std::string& raw) {
+H1Codec::parse_response_block(const std::string& raw, std::string* version_out) {
     HttpResponseHead head;
     std::istringstream iss(raw);
     std::string line;
@@ -384,6 +424,8 @@ H1Codec::parse_response_block(const std::string& raw) {
     std::istringstream rl(line);
     std::string version;
     rl >> version >> head.status_code;
+    if (version_out)
+        *version_out = version;
     if (head.status_code <= 0)
         return {head, "bad status line: " + line};
     std::getline(rl, head.reason);

@@ -38,10 +38,10 @@ private:
                               ResponseCallback cb);
 
     std::pair<HttpRequestHead, std::string>
-    parse_header_block(const std::string& raw);
+    parse_header_block(const std::string& raw, std::string* version_out);
 
     std::pair<HttpResponseHead, std::string>
-    parse_response_block(const std::string& raw);
+    parse_response_block(const std::string& raw, std::string* version_out);
 };
 
 } // namespace ebpf_quic_proxy

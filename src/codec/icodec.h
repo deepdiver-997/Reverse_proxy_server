@@ -9,13 +9,19 @@ namespace ebpf_quic_proxy {
 /// Protocol codec: parses requests from a stream, serializes responses to it.
 class ICodec {
 public:
+    /// Parse result callback.  `keep_alive` tells the relay whether this
+    /// connection/stream should stay open for another exchange — decided by
+    /// the protocol content (Connection header, HTTP version, body framing),
+    /// NOT hard-coded per transport.  (HTTP/3 streams are one-shot → false.)
     using ParseCallback = std::function<void(asio::error_code,
                                              HttpRequestHead,
-                                             BodySourcePtr)>;
+                                             BodySourcePtr,
+                                             bool keep_alive)>;
 
     using ResponseCallback = std::function<void(asio::error_code,
                                                 HttpResponseHead,
-                                                BodySourcePtr)>;
+                                                BodySourcePtr,
+                                                bool keep_alive)>;
 
     using WriteCallback =
         std::function<void(asio::error_code)>;

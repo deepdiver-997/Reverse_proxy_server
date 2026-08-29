@@ -147,14 +147,16 @@ void H3Codec::async_parse_request(ITransportStreamPtr stream,
         [stream, cb = std::move(cb)](asio::error_code ec,
                                      HttpRequestHead head) mutable {
             if (ec) {
-                cb(ec, {}, nullptr);
+                cb(ec, {}, nullptr, false);
                 return;
             }
             auto body = std::make_shared<StreamEofBodySource>(stream);
-            cb({}, std::move(head), std::move(body));
+            // HTTP/3 streams are one-shot — the connection persists at the
+            // session level, not via keep-alive on this stream.
+            cb({}, std::move(head), std::move(body), /*keep_alive=*/false);
         });
     if (!ok) {
-        cb(asio::error::operation_not_supported, {}, nullptr);
+        cb(asio::error::operation_not_supported, {}, nullptr, false);
     }
 }
 
@@ -196,7 +198,7 @@ void H3Codec::async_write_response(ITransportStreamPtr stream,
 void H3Codec::async_parse_response(ITransportStreamPtr stream,
                                    ResponseCallback cb) {
     spdlog::warn("H3: async_parse_response not implemented (H3 upstream not wired)");
-    cb(asio::error::operation_not_supported, {}, nullptr);
+    cb(asio::error::operation_not_supported, {}, nullptr, false);
 }
 
 void H3Codec::async_write_request(ITransportStreamPtr stream,

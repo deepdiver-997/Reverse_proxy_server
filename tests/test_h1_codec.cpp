@@ -48,7 +48,7 @@ TEST_CASE("H1Codec parses simple GET request", "[h1_codec]") {
 
     codec.async_parse_request(
         stream, [&](asio::error_code ec, HttpRequestHead head,
-                     BodySourcePtr body) {
+                     BodySourcePtr body, bool keep_alive) {
             called = true;
             REQUIRE_FALSE(ec);
             REQUIRE(head.method == "GET");
@@ -57,6 +57,8 @@ TEST_CASE("H1Codec parses simple GET request", "[h1_codec]") {
             REQUIRE(head.headers.get("accept").value() == "text/html");
             REQUIRE(!head.content_length.has_value());
             REQUIRE_FALSE(body);
+            // HTTP/1.1 without Connection: close → keep alive.
+            REQUIRE(keep_alive);
         });
 
     REQUIRE(called);
@@ -75,7 +77,7 @@ TEST_CASE("H1Codec parses POST with Content-Length", "[h1_codec]") {
 
     codec.async_parse_request(
         stream, [&](asio::error_code ec, HttpRequestHead head,
-                     BodySourcePtr body) {
+                     BodySourcePtr body, bool) {
             called = true;
             REQUIRE_FALSE(ec);
             REQUIRE(head.method == "POST");
@@ -104,7 +106,7 @@ TEST_CASE("H1Codec handles incomplete headers (multi-chunk)", "[h1_codec]") {
 
     codec.async_parse_request(
         stream, [&](asio::error_code ec, HttpRequestHead head,
-                     BodySourcePtr) {
+                     BodySourcePtr, bool) {
             called = true;
             REQUIRE_FALSE(ec);
             REQUIRE(head.method == "DELETE");

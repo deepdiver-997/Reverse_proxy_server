@@ -28,9 +28,6 @@ private:
     void do_accept();
     void on_session(ITransportSessionPtr session);
     void on_stream(ITransportStreamPtr stream, ICodec* codec);
-    void forward_request(ITransportStreamPtr client_stream, ICodec* client_codec,
-                         HttpRequestHead head, BodySourcePtr body,
-                         const std::string& backend_id);
 
     asio::io_context& io_;
     ITransportListenerPtr tcp_listener_;
