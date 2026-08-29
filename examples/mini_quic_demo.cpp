@@ -42,6 +42,15 @@
 // 直接以 void* 展示"库不碰内容、原样存原样还"。
 using mini_conn_ctx_t   = void;
 using mini_stream_ctx_t = void;
+//
+// [Q] 为什么引擎要单独给 ctx 指针，直接把 mini_conn_t/mini_stream_t 句柄传过来、
+//     让 ctx 字段在句柄内部不就行了？
+// [A] 在真实 lsquic 里，lsquic_conn_t / lsquic_stream_t 是【不透明类型】：结构体
+//     定义藏在库的 .c 里，应用只有指针、看不到任何字段，所以"句柄内部放 ctx"在
+//     真实 API 里做不到——库通过 get/set（lsquic_conn_get_ctx）或回调形参把 ctx
+//     还给你。本 demo 为了让教学可见才把结构体摊开、ctx 做成可见字段；但为了对齐
+//     lsquic 的形状，回调仍单独传 ctx。这样也演示了"库不管你的类型，只管帮你保管
+//     指针"的 C userdata 模式。
 
 struct mini_conn_t;
 struct mini_stream_t;
@@ -86,6 +95,11 @@ struct mini_engine_t {
     std::unordered_map<std::string, std::unique_ptr<mini_conn_t>> conns; // conns_hash
     const mini_stream_if* iface = nullptr;
     void* if_ctx = nullptr;                                  // <-> ea_stream_if_ctx
+    // [A] if_ctx = "回调表的 this"。一套回调函数可以被多个引擎实例共用，
+    //     靠 if_ctx 区分"这次回调属于哪个引擎/listener"。真实代码里
+    //     ea_stream_if_ctx = this（QuicTransportListener*），回调里 cast 回来。
+    //     它和 conn_ctx（每连接）、stream_ctx（每流）是三个层级：
+    //     if_ctx 引擎级(1)  <->  conn_ctx 连接级(N)  <->  stream_ctx 流级(N×M)
 };
 
 // ── 流读：<-> lsquic_stream_read ──
@@ -227,6 +241,11 @@ struct AppStream {    // 等价于 QuicTransportStream
 };
 
 mini_conn_ctx_t* app_on_new_conn(void* /*if_ctx*/, mini_conn_t* conn) {
+    // [A] 为什么是"我们返回"：因为库不知道你的应用类型。库给你一个 void* 槽位，
+    //     你在回调里 new 出自己的 C++ 对象（AppSession，真实代码里是
+    //     QuicTransportSession）返回给库；库存起来、之后所有回调原样还给你。
+    //     于是"应用对象"随连接而存在、由你负责释放（on_conn_closed 里 delete）——
+    //     生命周期归应用，库只管保管指针，互不越界。
     auto* sess = new AppSession;
     std::printf("[app]   on_new_conn: new session %p for conn %p\n",
                 (void*)sess, (void*)conn);
