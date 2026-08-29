@@ -34,6 +34,10 @@ public:
 
 private:
     void request_phase();
+    void handle_connect(HttpRequestHead head); // CONNECT → tunnel
+    void start_tunnel();
+    void bridge_mode();
+    void pump_bytes(ITransportStreamPtr src, ITransportStreamPtr dst);
     void send_backend_request(bool retry_allowed);
     void reconnect_backend_fresh();
     void response_phase();

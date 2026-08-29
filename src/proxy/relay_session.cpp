@@ -1,5 +1,6 @@
 #include "relay_session.h"
 #include <spdlog/spdlog.h>
+#include <cstdlib>
 
 namespace ebpf_quic_proxy {
 
@@ -35,6 +36,13 @@ void RelaySession::request_phase() {
                          head.headers.get("host").value_or("-"),
                          client_->stream_id());
 
+            // CONNECT → a raw bidirectional tunnel to the requested target
+            // (forward-proxy style), bypassing the route table entirely.
+            if (head.method == "CONNECT") {
+                handle_connect(std::move(head));
+                return;
+            }
+
             auto backend_id = router_->route(head);
             if (backend_id.empty()) {
                 spdlog::warn("no route for host={}",
@@ -62,6 +70,93 @@ void RelaySession::request_phase() {
                         std::make_shared<HttpRequestHead>(std::move(head));
                     pending_body_ = std::move(body);
                     send_backend_request(/*retry_allowed=*/true);
+                });
+        });
+}
+
+// ── CONNECT tunnel (Bridge mode) ──────────────────────────
+
+void RelaySession::handle_connect(HttpRequestHead head) {
+    // target is in the request path: "host:port".
+    auto colon = head.path.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= head.path.size()) {
+        write_error(HttpStatus::BadRequest, "bad CONNECT target\n");
+        return;
+    }
+    std::string host = head.path.substr(0, colon);
+    char* end = nullptr;
+    unsigned long port = std::strtoul(head.path.c_str() + colon + 1, &end, 10);
+    if (host.empty() || port == 0 || port > 65535) {
+        write_error(HttpStatus::BadRequest, "bad CONNECT target\n");
+        return;
+    }
+
+    spdlog::info("CONNECT {}:{} from {}", host, port, client_->stream_id());
+
+    BackendEndpoint target{"", host, static_cast<uint16_t>(port), 1};
+    auto self = shared_from_this();
+    pool_->async_connect_fresh(
+        target,
+        [this, self](asio::error_code ec, ITransportStreamPtr stream,
+                     const BackendEndpoint& endpoint, bool) {
+            if (ec) {
+                write_error(HttpStatus::BadGateway, "connect failed\n");
+                return;
+            }
+            backend_ = std::move(stream);
+            backend_endpoint_ = endpoint;
+            start_tunnel();
+        });
+}
+
+void RelaySession::start_tunnel() {
+    // Send "200 Connection Established" through the client codec (correct H1
+    // framing for this H1-only method), then switch to raw byte bridging.
+    auto self = shared_from_this();
+    HttpResponseHead resp;
+    resp.status_code = 200;
+    resp.reason = "Connection Established";
+    client_codec_->async_write_response(
+        client_, std::move(resp), nullptr,
+        [this, self](asio::error_code ec) {
+            if (ec) {
+                teardown();
+                return;
+            }
+            bridge_mode();
+        });
+}
+
+void RelaySession::bridge_mode() {
+    // Two independent event-driven pumps: client ⇄ target.  When either side
+    // ends (EOF/error), teardown closes both.
+    pump_bytes(client_, backend_);
+    pump_bytes(backend_, client_);
+}
+
+void RelaySession::pump_bytes(ITransportStreamPtr src, ITransportStreamPtr dst) {
+    auto self = shared_from_this();
+    auto buf = std::make_shared<std::array<char, 16384>>();
+    src->async_read_some(
+        asio::buffer(*buf),
+        [this, self, src, dst, buf](asio::error_code ec, std::size_t n) mutable {
+            if (done_)
+                return;
+            if (ec || n == 0) { // source closed / EOF
+                teardown();
+                return;
+            }
+            dst->async_write_some(
+                asio::buffer(buf->data(), n),
+                [this, self, src, dst, buf](asio::error_code ec,
+                                            std::size_t) mutable {
+                    if (done_)
+                        return;
+                    if (ec) {
+                        teardown();
+                        return;
+                    }
+                    pump_bytes(src, dst); // continue pumping
                 });
         });
 }
