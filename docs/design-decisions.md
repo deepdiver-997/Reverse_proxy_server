@@ -56,21 +56,35 @@
 **泵的粒度**：纯隧道（CONNECT / WebSocket / 裸 TCP）按字节泵、不经 codec；HTTP 若要改写头（Host/Via/X-Forwarded-For）需按消息粒度泵（解析 → 改写 → 转发），codec 参与。
 **现状**：`ProxyCore::forward_request` 是一次性的简化版（写请求 → 读一条响应 → 关）；RelaySession 是其通用化（持久、双向、可选消息级改写）。
 
+**RelaySession 骨架**：
+```cpp
+struct RelaySession : std::enable_shared_from_this<RelaySession> {
+    ITransportStreamPtr client;     // 客户端流（TCP 或 QUIC stream）
+    ITransportStreamPtr backend;    // 后端流（TCP）
+    ICodec* client_codec;           // 解析客户端请求 / 生成客户端响应（H1 或 H3）
+    ICodec* backend_codec;          // 生成后端请求 / 解析后端响应（目前 H1）
+    // 需要时注入 Router / UpstreamPool
+};
+```
+- 两条流用 shared_ptr 持有：后端流将来归还连接池时，pool 与 relay 各持一份，relay 结束释放自己那份 = 天然支持「借用/归还」复用。
+- 依赖注入优于背一个裸 `ProxyCore*`（relay 真正需要的是 codec + router + pool 三样）。
+- **泵粒度分界**：先解析请求头 → IR → 路由；同协议且不改写 → 头原样转发 + body/响应字节泵（快速路径）；跨协议或需改写 → 整条消息走 IR 转换；CONNECT/WebSocket 握手后完全字节泵、不经 codec。
+
+### ADR-8：HTTP/3 头处理走 lsquic 原生（路线 B）
+
+**背景**：原开放问题 ①——H3 头处理是手写帧解析（路线 A）还是 lsquic 原生（路线 B）。
+**决策**：**路线 B**。lsquic 拥有 H3 帧层 + QPACK；实现完整 HSI（QPACK/lsxpack）、用 `on_hset_in`/`lsquic_stream_get_hset` 取头、用 `lsquic_stream_send_headers` 发响应。
+**理由**：
+- QPACK（RFC 9204）与 HPACK 同量级复杂度（动态表/静态表/Huffman/blocked stream），手写正确且互操作 = 数周工作量 + 大正确性风险，demo 不值得。
+- 现状 `H3Codec` 的 literal-headers（无 QPACK）**不可与真实客户端互操作**——浏览器 / `curl --http3` 发的是 QPACK 压缩头。
+- "减少依赖"不成立：QUIC 层本就依赖 lsquic；路线 A 只是换成自写 QPACK（或 vendoring lshpack/nghttp3 的更多胶水）。
+**待办**：实现完整 HSI；`H3Codec` 改为坐在 lsquic 原生 H3 之上（parse 走 `get_hset`、serialize 走 `send_headers`）；移除假 HSI 与手写帧解析的混搭。
+
 ## 开放问题（需要决策）
 
-### ① HTTP/3 头处理：手写帧解析 vs lsquic 原生 H3 ⭐ 最重要
+### ① HTTP/3 头处理 ⭐ 已决策
 
-现状是**两套架构混在一起，互不兼容**：
-
-- `QuicTransportListener` 用 `LSENG_HTTP` 标志 + 一个返回 `nullptr` 的假 `hsi_prepare_decode`（当前工作区改动，未提交）。
-- 而 `H3Codec` 是**从头解析裸 H3 帧**（HEADERS/DATA varint 帧头）。
-
-问题：`LSENG_HTTP` 下 lsquic **自己拥有 H3 帧层**——它解码 QPACK、消费 HEADERS 帧、把 `lsquic_stream_write` 的内容包进 DATA 帧、并要求先 `lsquic_stream_send_headers`。此时流里读到的不是裸帧，`H3Codec` 解析不了；返回 `nullptr` 的假 HSI 还可能导致 header decode 失败路径。**两者只能选一个：**
-
-- **路线 A：裸模式（与现有 H3Codec 自洽）**。`LSENG_SERVER`（去掉 `LSENG_HTTP`），不设 `ea_hsi_if`，让 `H3Codec` 从裸流解析、响应也手写 H3 帧。改动小，但与 lsquic 自带的 H3 支持重复造轮子。
-- **路线 B：lsquic 原生 H3**。实现完整 HSI（QPACK/lsxpack）、用 `on_hset_in`/`lsquic_stream_get_hset` 取头、用 `lsquic_stream_send_headers` 发响应。更"正统"，但要写 QPACK 相关胶水。
-
-**建议**：demo 阶段走 A 更务实；想贴近生产走 B。决策前不要在这两种状态间反复横跳。
+已决策：**路线 B（lsquic 原生 H3）**，理由与实现待办见 [ADR-8](#adr-8http3-头处理走-lsquic-原生路线-b)。原"手写 vs 原生"二选一已关闭；剩余是 ADR-8 里的实现待办。
 
 ### ② 响应路径绕过 codec
 

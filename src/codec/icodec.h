@@ -13,6 +13,10 @@ public:
                                              HttpRequestHead,
                                              BodySourcePtr)>;
 
+    using ResponseCallback = std::function<void(asio::error_code,
+                                                HttpResponseHead,
+                                                BodySourcePtr)>;
+
     using WriteCallback =
         std::function<void(asio::error_code)>;
 
@@ -22,6 +26,17 @@ public:
     /// On success, cb(ec, head, body) — body may be nullptr if no body.
     virtual void async_parse_request(ITransportStreamPtr stream,
                                      ParseCallback cb) = 0;
+
+    /// Parse one HTTP response from the stream.
+    /// On success, cb(ec, head, body) — body may be nullptr if no body.
+    virtual void async_parse_response(ITransportStreamPtr stream,
+                                      ResponseCallback cb) = 0;
+
+    /// Write a request to the stream, including body if present.
+    virtual void async_write_request(ITransportStreamPtr stream,
+                                     HttpRequestHead head,
+                                     BodySourcePtr body,
+                                     WriteCallback cb) = 0;
 
     /// Write a response to the stream, including body if present.
     virtual void async_write_response(ITransportStreamPtr stream,

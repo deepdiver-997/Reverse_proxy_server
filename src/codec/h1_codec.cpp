@@ -1,10 +1,209 @@
 #include "h1_codec.h"
 #include <asio.hpp>
+#include <algorithm>
 #include <cstdlib>
 #include <sstream>
 #include <string_view>
 
 namespace ebpf_quic_proxy {
+
+namespace {
+
+/// Decodes HTTP/1.1 chunked transfer-encoding (RFC 9112 §7.1).
+/// Returns one chunk's worth of data per async_read_some call; 0 = body end.
+class ChunkedBodySource final : public BodySource,
+                                public std::enable_shared_from_this<ChunkedBodySource> {
+public:
+    explicit ChunkedBodySource(ITransportStreamPtr stream)
+        : stream_(std::move(stream)) {}
+
+    void async_read_some(asio::mutable_buffer buf, ReadCallback cb) override {
+        auto self = shared_from_this();
+        if (finished_) {
+            cb({}, 0);
+            return;
+        }
+        if (chunk_remaining_ == 0)
+            read_size_line(buf, std::move(cb));
+        else
+            read_chunk_payload(buf, std::move(cb));
+    }
+
+    std::optional<std::size_t> content_length() const override {
+        return std::nullopt; // chunked → length unknown up front
+    }
+
+private:
+    void read_size_line(asio::mutable_buffer buf, ReadCallback cb) {
+        auto self = shared_from_this();
+        read_line([this, self, buf, cb](bool ok) mutable {
+            if (!ok) {
+                finished_ = true;
+                cb(asio::error::eof, 0);
+                return;
+            }
+            auto semi = size_line_.find(';');
+            if (semi != std::string::npos)
+                size_line_.resize(semi); // drop chunk extensions
+            char* end = nullptr;
+            unsigned long sz = std::strtoul(size_line_.c_str(), &end, 16);
+            if (end == size_line_.c_str()) { // no hex digits
+                finished_ = true;
+                cb(asio::error::invalid_argument, 0);
+                return;
+            }
+            size_line_.clear();
+            chunk_remaining_ = static_cast<std::size_t>(sz);
+            if (chunk_remaining_ == 0) { // last-chunk → body exhausted
+                finished_ = true;
+                cb({}, 0);
+                return;
+            }
+            read_chunk_payload(buf, std::move(cb));
+        });
+    }
+
+    void read_chunk_payload(asio::mutable_buffer buf, ReadCallback cb) {
+        auto self = shared_from_this();
+        std::size_t want = std::min(buf.size(), chunk_remaining_);
+        stream_->async_read_some(
+            asio::buffer(buf.data(), want),
+            [this, self, cb](asio::error_code ec, std::size_t n) mutable {
+                if (ec) {
+                    finished_ = true;
+                    cb(ec, 0);
+                    return;
+                }
+                chunk_remaining_ -= n;
+                if (chunk_remaining_ == 0) {
+                    // Each chunk's data ends with CRLF; consume it before the
+                    // next chunk-size line.
+                    skip_crlf([this, self, cb, n](bool ok) mutable {
+                        if (!ok) {
+                            finished_ = true;
+                            cb(asio::error::eof, 0);
+                            return;
+                        }
+                        cb({}, n);
+                    });
+                } else {
+                    cb({}, n);
+                }
+            });
+    }
+
+    void skip_crlf(std::function<void(bool)> done) {
+        auto self = shared_from_this();
+        read_exact(2, [this, self, done](bool ok) { done(ok); });
+    }
+
+    void read_line(std::function<void(bool)> done) {
+        size_line_.clear();
+        read_line_byte(std::move(done));
+    }
+
+    void read_line_byte(std::function<void(bool)> done) {
+        auto self = shared_from_this();
+        std::array<char, 1> b;
+        stream_->async_read_some(
+            asio::buffer(b),
+            [this, self, done, b](asio::error_code ec, std::size_t n) mutable {
+                if (ec || n == 0) {
+                    done(false);
+                    return;
+                }
+                if (b[0] == '\n') {
+                    done(true);
+                    return;
+                }
+                if (b[0] != '\r')
+                    size_line_.push_back(b[0]);
+                read_line_byte(std::move(done));
+            });
+    }
+
+    // Reads exactly `count` bytes, discarding them (skips a CRLF).
+    void read_exact(std::size_t count, std::function<void(bool)> done) {
+        auto self = shared_from_this();
+        std::array<char, 64> buf;
+        std::size_t take = std::min(count, buf.size());
+        stream_->async_read_some(
+            asio::buffer(buf, take),
+            [this, self, count, done](asio::error_code ec, std::size_t n) mutable {
+                if (ec || n == 0) {
+                    done(false);
+                    return;
+                }
+                if (n >= count) {
+                    done(true);
+                    return;
+                }
+                read_exact(count - n, std::move(done));
+            });
+    }
+
+    ITransportStreamPtr stream_;
+    std::string size_line_;
+    std::size_t chunk_remaining_ = 0;
+    bool finished_ = false;
+};
+
+/// Body until the connection closes (responses with no Content-Length/chunked).
+class CloseDelimitedBodySource final : public BodySource,
+                                       public std::enable_shared_from_this<CloseDelimitedBodySource> {
+public:
+    explicit CloseDelimitedBodySource(ITransportStreamPtr stream)
+        : stream_(std::move(stream)) {}
+
+    void async_read_some(asio::mutable_buffer buf, ReadCallback cb) override {
+        auto self = shared_from_this();
+        stream_->async_read_some(
+            buf, [self, cb](asio::error_code ec, std::size_t n) {
+                if (ec == asio::error::eof)
+                    cb({}, 0); // EOF = end of body
+                else if (ec)
+                    cb(ec, 0);
+                else
+                    cb({}, n);
+            });
+    }
+
+    std::optional<std::size_t> content_length() const override {
+        return std::nullopt;
+    }
+
+private:
+    ITransportStreamPtr stream_;
+};
+
+// Shared pump: recursively forward body bytes into `stream` until exhausted.
+void pump_body(ITransportStreamPtr stream, BodySourcePtr body,
+               ICodec::WriteCallback cb) {
+    auto pump = std::make_shared<std::function<void()>>();
+    auto buf = std::make_shared<std::array<char, 8192>>();
+    *pump = [stream, body, cb, pump, buf]() mutable {
+        body->async_read_some(
+            asio::buffer(*buf),
+            [stream, body, cb, pump, buf](asio::error_code ec, std::size_t n) mutable {
+                if (ec || n == 0) {
+                    cb(ec);
+                    return;
+                }
+                stream->async_write_some(
+                    asio::buffer(buf->data(), n),
+                    [pump, cb](asio::error_code ec, std::size_t) mutable {
+                        if (ec) {
+                            cb(ec);
+                            return;
+                        }
+                        (*pump)();
+                    });
+            });
+    };
+    (*pump)();
+}
+
+} // namespace
 
 
 // ── Parse request ─────────────────────────────────────────
@@ -140,19 +339,148 @@ H1Codec::parse_header_block(const std::string& raw) {
     return {std::move(head), {}};
 }
 
-// ── Write response ────────────────────────────────────────
+// ── Parse response ────────────────────────────────────────
 
-void H1Codec::async_write_response(ITransportStreamPtr stream,
-                                    HttpResponseHead head, BodySourcePtr body,
-                                    WriteCallback cb) {
-    // Build header block.
+void H1Codec::async_parse_response(ITransportStreamPtr stream,
+                                   ResponseCallback cb) {
+    auto buf = std::make_shared<std::vector<char>>();
+    buf->reserve(4096);
+    read_response_header(std::move(stream), std::move(buf), std::move(cb));
+}
+
+void H1Codec::read_response_header(ITransportStreamPtr stream,
+                                   std::shared_ptr<std::vector<char>> buf,
+                                   ResponseCallback cb) {
+    auto chunk = std::make_shared<std::array<char, 4096>>();
+    auto* raw_stream = stream.get();
+    raw_stream->async_read_some(
+        asio::buffer(*chunk),
+        [this, stream = std::move(stream), buf = std::move(buf),
+         cb = std::move(cb), chunk](asio::error_code ec,
+                                    std::size_t n) mutable {
+            if (ec) {
+                cb(ec, {}, nullptr);
+                return;
+            }
+            if (n == 0) {
+                cb(asio::error::eof, {}, nullptr);
+                return;
+            }
+
+            buf->insert(buf->end(), chunk->begin(), chunk->begin() + n);
+            std::string_view view(buf->data(), buf->size());
+            auto pos = view.find("\r\n\r\n");
+            if (pos == std::string_view::npos) {
+                read_response_header(std::move(stream), std::move(buf),
+                                     std::move(cb));
+                return;
+            }
+
+            std::string raw_block(buf->data(), pos + 4);
+            std::string body_prefix(buf->data() + pos + 4,
+                                    buf->size() - pos - 4);
+
+            auto [head, err] = parse_response_block(raw_block);
+            if (!err.empty()) {
+                cb(asio::error::invalid_argument, {}, nullptr);
+                return;
+            }
+
+            BodySourcePtr body_src;
+            // Status-determined no-body responses.
+            if (head.status_code / 100 == 1 || head.status_code == 204 ||
+                head.status_code == 304) {
+                // no body
+            } else if (auto te = head.headers.get("transfer-encoding");
+                       te && te->find("chunked") != std::string::npos) {
+                // Note: any bytes already read past the header block are
+                // dropped (rare in practice) — FIXME seed the decoder.
+                body_src = std::make_shared<ChunkedBodySource>(stream);
+            } else if (head.content_length.has_value()) {
+                std::size_t remaining = *head.content_length;
+                if (!body_prefix.empty()) {
+                    std::size_t prefix_len =
+                        std::min(body_prefix.size(), remaining);
+                    std::string prefix_data =
+                        body_prefix.substr(0, prefix_len);
+                    remaining -= prefix_len;
+                    if (remaining == 0) {
+                        body_src = std::make_shared<BufferBodySource>(
+                            std::move(prefix_data));
+                    } else {
+                        // Prefix lost for the remainder — FIXME same as request.
+                        body_src = std::make_shared<StreamBodySource>(
+                            stream, remaining);
+                    }
+                } else if (remaining > 0) {
+                    body_src = std::make_shared<StreamBodySource>(
+                        stream, remaining);
+                }
+            } else {
+                body_src = std::make_shared<CloseDelimitedBodySource>(stream);
+            }
+
+            cb({}, std::move(head), std::move(body_src));
+        });
+}
+
+std::pair<HttpResponseHead, std::string>
+H1Codec::parse_response_block(const std::string& raw) {
+    HttpResponseHead head;
+    std::istringstream iss(raw);
+    std::string line;
+
+    // Status line: HTTP/1.1 SP STATUS SP REASON
+    if (!std::getline(iss, line) || line.empty())
+        return {head, "empty response"};
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+
+    std::istringstream rl(line);
+    std::string version;
+    rl >> version >> head.status_code;
+    if (head.status_code <= 0)
+        return {head, "bad status line: " + line};
+    std::getline(rl, head.reason);
+    // Trim leading space from reason (" OK" → "OK").
+    auto start = head.reason.find_first_not_of(" \t");
+    if (start != std::string::npos)
+        head.reason = head.reason.substr(start);
+
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            break;
+
+        auto colon = line.find(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        auto vs = val.find_first_not_of(" \t");
+        if (vs != std::string::npos)
+            val = val.substr(vs);
+        head.headers.add(key, val);
+    }
+
+    if (auto cl = head.headers.get("content-length"))
+        head.content_length = std::strtoul(cl->c_str(), nullptr, 10);
+
+    return {std::move(head), {}};
+}
+
+// ── Write request / response ──────────────────────────────
+
+void H1Codec::async_write_request(ITransportStreamPtr stream,
+                                  HttpRequestHead head, BodySourcePtr body,
+                                  WriteCallback cb) {
     std::ostringstream oss;
-    oss << "HTTP/1.1 " << head.status_code << " " << head.reason << "\r\n";
+    oss << head.method << " " << head.path << " HTTP/1.1\r\n";
     oss << head.headers.to_wire();
     oss << "\r\n";
 
     auto header_str = std::make_shared<std::string>(oss.str());
-
     stream->async_write_some(
         asio::buffer(*header_str),
         [stream, body = std::move(body), cb = std::move(cb),
@@ -161,32 +489,28 @@ void H1Codec::async_write_response(ITransportStreamPtr stream,
                 cb(ec);
                 return;
             }
-            // Pump body into the stream.
-            // Phase 1: simple recursive pump.
-            auto pump = std::make_shared<std::function<void()>>();
-            auto buf = std::make_shared<std::array<char, 8192>>();
-            *pump = [stream, body, cb, pump, buf]() mutable {
-                body->async_read_some(
-                    asio::buffer(*buf),
-                    [stream, body, cb, pump,
-                     buf](asio::error_code ec, std::size_t n) mutable {
-                        if (ec || n == 0) {
-                            cb(ec);
-                            return;
-                        }
-                        stream->async_write_some(
-                            asio::buffer(buf->data(), n),
-                            [pump, cb](asio::error_code ec,
-                                        std::size_t) mutable {
-                                if (ec) {
-                                    cb(ec);
-                                    return;
-                                }
-                                (*pump)();
-                            });
-                    });
-            };
-            (*pump)();
+            pump_body(std::move(stream), std::move(body), std::move(cb));
+        });
+}
+
+void H1Codec::async_write_response(ITransportStreamPtr stream,
+                                    HttpResponseHead head, BodySourcePtr body,
+                                    WriteCallback cb) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << head.status_code << " " << head.reason << "\r\n";
+    oss << head.headers.to_wire();
+    oss << "\r\n";
+
+    auto header_str = std::make_shared<std::string>(oss.str());
+    stream->async_write_some(
+        asio::buffer(*header_str),
+        [stream, body = std::move(body), cb = std::move(cb),
+         header_str](asio::error_code ec, std::size_t) mutable {
+            if (ec || !body) {
+                cb(ec);
+                return;
+            }
+            pump_body(std::move(stream), std::move(body), std::move(cb));
         });
 }
 

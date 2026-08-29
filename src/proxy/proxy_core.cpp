@@ -1,10 +1,31 @@
 #include "proxy_core.h"
 #include "codec/h1_codec.h"
 #include "codec/h3_codec.h"
+#include "relay_session.h"
 #include "transport/tcp_transport.h"
 #include <spdlog/spdlog.h>
 
 namespace ebpf_quic_proxy {
+
+namespace {
+
+// Write an error response to `stream` through `codec`, then shut it down.
+// Goes through the codec so the response is correctly framed for the client's
+// protocol (H1 or H3).
+void write_error(ICodec* codec, ITransportStreamPtr stream, HttpStatus status,
+                 const std::string& msg) {
+    HttpResponseHead resp;
+    resp.status_code = static_cast<int>(status);
+    resp.reason = status_reason(status);
+    resp.headers.set("content-type", "text/plain");
+    resp.headers.set("content-length", std::to_string(msg.size()));
+    codec->async_write_response(
+        std::move(stream), std::move(resp),
+        std::make_shared<BufferBodySource>(msg),
+        [](asio::error_code) {});
+}
+
+} // namespace
 
 
 ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
@@ -82,10 +103,10 @@ void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     spdlog::debug("new stream {}", stream->stream_id());
 
     // Parse the request.
-    auto* raw = stream.get();
     codec->async_parse_request(
-        stream, [this, stream](asio::error_code ec,
-                                HttpRequestHead head, BodySourcePtr body) {
+        stream, [this, stream, codec](asio::error_code ec,
+                                      HttpRequestHead head,
+                                      BodySourcePtr body) mutable {
             if (ec) {
                 spdlog::debug("parse error on {}: {}", stream->stream_id(),
                               ec.message());
@@ -101,142 +122,42 @@ void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
             if (backend_id.empty()) {
                 spdlog::warn("no route for host={}",
                              head.headers.get("host").value_or("-"));
-                auto err_body = std::make_shared<std::string>(
-                    make_error_response(HttpStatus::ServiceUnavailable,
-                                        "no route for host\n"));
-                stream->async_write_some(
-                    asio::buffer(*err_body),
-                    [stream, err_body](auto, auto) {
-                        stream->async_shutdown([](auto) {});
-                    });
+                write_error(codec, stream, HttpStatus::ServiceUnavailable,
+                            "no route for host\n");
                 return;
             }
 
-            forward_request(stream, std::move(head), std::move(body),
-                            std::move(backend_id));
+            forward_request(std::move(stream), codec, std::move(head),
+                            std::move(body), std::move(backend_id));
         });
 }
 
 void ProxyCore::forward_request(ITransportStreamPtr client_stream,
-                                 HttpRequestHead head, BodySourcePtr body,
-                                 const std::string& backend_id) {
+                                ICodec* client_codec, HttpRequestHead head,
+                                BodySourcePtr body,
+                                const std::string& backend_id) {
     upstream_pool_.async_connect(
         backend_id,
-        [this, client_stream, head = std::move(head), body = std::move(body),
+        [this, client_stream, client_codec, head = std::move(head),
+         body = std::move(body),
          backend_id](asio::error_code ec,
-                      ITransportStreamPtr upstream_stream) mutable {
+                     ITransportStreamPtr upstream_stream) mutable {
             if (ec) {
                 spdlog::warn("upstream connect failed: {}", ec.message());
-                auto err_body = std::make_shared<std::string>(
-                    make_error_response(HttpStatus::BadGateway,
-                                        "upstream unreachable\n"));
-                client_stream->async_write_some(
-                    asio::buffer(*err_body),
-                    [client_stream, err_body](auto, auto) {
-                        client_stream->async_shutdown([](auto) {});
-                    });
+                write_error(client_codec, std::move(client_stream),
+                            HttpStatus::BadGateway, "upstream unreachable\n");
                 return;
             }
 
-            // Forward the request to upstream.
-            // Build the HTTP/1.1 request line + headers.
-            std::string req_line = head.method + " " + head.path + " HTTP/1.1";
-            std::string req_hdrs = head.headers.to_wire();
-            std::string req_block = req_line + "\r\n" + req_hdrs + "\r\n";
-
-            auto req_data = std::make_shared<std::string>(std::move(req_block));
-
-            upstream_stream->async_write_some(
-                asio::buffer(*req_data),
-                [upstream_stream, body = std::move(body),
-                 client_stream](asio::error_code ec,
-                                 std::size_t) mutable {
-                    if (ec) {
-                        spdlog::warn("write request failed: {}", ec.message());
-                        auto err_body = std::make_shared<std::string>(
-                            make_error_response(HttpStatus::BadGateway,
-                                                "backend write error\n"));
-                        client_stream->async_write_some(
-                            asio::buffer(*err_body),
-                            [client_stream, err_body](auto, auto) {
-                                client_stream->async_shutdown([](auto) {});
-                            });
-                        return;
-                    }
-
-                    // Pump body if present.
-                    if (!body) {
-                        // No body — read response immediately.
-                        // Phase 1: just read response into a buffer and
-                        // forward.  A real implementation would stream this.
-                        auto resp_buf =
-                            std::make_shared<std::vector<char>>(8192);
-                        upstream_stream->async_read_some(
-                            asio::buffer(*resp_buf),
-                            [client_stream, upstream_stream,
-                             resp_buf](asio::error_code ec,
-                                        std::size_t n) mutable {
-                                if (ec && ec != asio::error::eof) {
-                                    spdlog::warn("read response failed: {}",
-                                                 ec.message());
-                                    return;
-                                }
-                                // Forward raw response back to client.
-                                client_stream->async_write_some(
-                                    asio::buffer(resp_buf->data(), n),
-                                    [client_stream, upstream_stream,
-                                     resp_buf](auto, auto) {
-                                        // Shutdown to signal end of response.
-                                        client_stream->async_shutdown(
-                                            [](auto) {});
-                                    });
-                            });
-                        return;
-                    }
-
-                    // Has body — pump it (Phase 1: simple recursive pump).
-                    auto pump = std::make_shared<std::function<void()>>();
-                    auto buf = std::make_shared<std::array<char, 8192>>();
-                    *pump = [body, upstream_stream, client_stream, pump,
-                             buf]() mutable {
-                        body->async_read_some(
-                            asio::buffer(*buf),
-                            [upstream_stream, client_stream, pump,
-                             buf](asio::error_code ec,
-                                   std::size_t n) mutable {
-                                if (ec || n == 0) {
-                                    // Body done — read response.
-                                    auto resp_buf =
-                                        std::make_shared<std::vector<char>>(
-                                            8192);
-                                    upstream_stream->async_read_some(
-                                        asio::buffer(*resp_buf),
-                                        [client_stream, upstream_stream,
-                                         resp_buf](auto ec, auto n) mutable {
-                                            if (ec && ec != asio::error::eof)
-                                                return;
-                                            client_stream->async_write_some(
-                                                asio::buffer(resp_buf->data(),
-                                                              n),
-                                                [client_stream, upstream_stream,
-                                                 resp_buf](auto, auto) {
-                                                    client_stream
-                                                        ->async_shutdown(
-                                                            [](auto) {});
-                                                });
-                                        });
-                                    return;
-                                }
-                                upstream_stream->async_write_some(
-                                    asio::buffer(buf->data(), n),
-                                    [pump](auto ec, auto) mutable {
-                                        if (ec) return;
-                                        (*pump)();
-                                    });
-                            });
-                    };
-                    (*pump)();
-                });
+            // Both sides are now connected — hand off to a RelaySession which
+            // serializes the request to the backend (backend codec), parses the
+            // backend response, and serializes it back to the client (client
+            // codec).  Response direction now goes through the codec.
+            std::string method = head.method; // save before moving head
+            auto session = std::make_shared<RelaySession>(
+                std::move(client_stream), std::move(upstream_stream),
+                client_codec, h1_codec_.get());
+            session->forward(std::move(head), std::move(body), method);
         });
 }
 

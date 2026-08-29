@@ -42,6 +42,7 @@ add_executable(ebpf-quic-proxy
     src/proxy/router.cpp
     src/proxy/upstream_pool.cpp
     src/proxy/proxy_core.cpp
+    src/proxy/relay_session.cpp
 )
 
 target_include_directories(ebpf-quic-proxy PRIVATE

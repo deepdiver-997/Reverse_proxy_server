@@ -406,4 +406,25 @@ void H3Codec::async_write_response(ITransportStreamPtr stream,
         });
 }
 
+// ═══════════════════════════════════════════════════════════
+// H3Codec — async_parse_response / async_write_request
+// ═══════════════════════════════════════════════════════════
+// TODO (ADR-8): route B — sit on lsquic's native H3 (get_hset for parse,
+// lsquic_stream_send_headers for write). Until then these are explicit
+// "not supported" stubs; the literal-frame path below does NOT interoperate
+// with real QPACK clients and must not be relied on.
+
+void H3Codec::async_parse_response(ITransportStreamPtr stream,
+                                   ResponseCallback cb) {
+    spdlog::warn("H3: async_parse_response not implemented (route B pending)");
+    cb(asio::error::operation_not_supported, {}, nullptr);
+}
+
+void H3Codec::async_write_request(ITransportStreamPtr stream,
+                                  HttpRequestHead head, BodySourcePtr body,
+                                  WriteCallback cb) {
+    spdlog::warn("H3: async_write_request not implemented (route B pending)");
+    cb(asio::error::operation_not_supported);
+}
+
 } // namespace ebpf_quic_proxy

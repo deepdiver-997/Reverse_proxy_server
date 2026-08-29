@@ -53,6 +53,14 @@ public:
     void async_parse_request(ITransportStreamPtr stream,
                               ParseCallback cb) override;
 
+    void async_parse_response(ITransportStreamPtr stream,
+                              ResponseCallback cb) override;
+
+    void async_write_request(ITransportStreamPtr stream,
+                             HttpRequestHead head,
+                             BodySourcePtr body,
+                             WriteCallback cb) override;
+
     void async_write_response(ITransportStreamPtr stream,
                               HttpResponseHead head,
                               BodySourcePtr body,
