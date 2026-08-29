@@ -135,3 +135,42 @@ stream_ctx（流级，N×M） 每流一份，指向 QuicTransportStream      —
 `iface`（回调表）是一个**应用所有、独立初始化的公共结构体**（lsquic 里是 `lsquic_engine_api`），构造时注入引擎；引擎内部持有一份私有指针用于调用，但**不通过引擎对象向外暴露**。因为它本质是 C 的 vtable（引擎是 C 结构体，没有虚方法），`if_ctx` 就是 `this`，一套表可服务多个引擎实例。
 
 （配套参考：`examples/mini_quic_demo.cpp` 逐条对应这些概念，含注释问答。）
+
+## 8. 生命周期契约：如何安全释放（teardown）
+
+一条铁律：**lsquic 对象的析构发生在"我们的最后一次回调返回之后"，不是之前。**
+
+### 关闭路径
+
+- 应用关闭：`QuicTransportSession::close()` → `lsquic_conn_close`；流用 `async_shutdown()` → `lsquic_stream_shutdown`。**用公开接口，别绕过 wrapper 碰裸 lsquic 指针**，保证标志一致。
+- 对端关闭：RST_STREAM / FIN / CONNECTION_CLOSE。
+- 被动关闭：超时、错误、listener 析构（`lsquic_engine_destroy` 会逐个触发关闭回调）。
+
+无论哪条路径，都汇到同一点：**lsquic 调用我们注册的回调**（`on_conn_closed` / `on_close`）。
+
+### teardown 顺序（以连接为例，流完全一致）
+
+```
+lsquic 决定关闭连接
+  │
+  ▼ ① 调用 on_conn_closed_cb —— 此刻 lsquic 的 conn 对象仍【完全有效】
+     ② 回调里：先 shared_from_this() 拿保活拷贝
+     ③ on_closed()：置 conn_ = nullptr（从此不再摸 lsquic）、改 closed_ 标志
+     ④ release_self()：释放自持
+     ⑤ 回调返回，保活拷贝析构 → wrapper 析构
+  ▼ ⑥ lsquic 这才真正 free 它的 conn 对象
+```
+
+**关键：回调是 wrapper 最后一次碰 lsquic 句柄的时刻；之后 lsquic 才释放它，而句柄已在回调里置空。**
+
+### 为什么不会泄漏
+
+- **wrapper 不泄漏**：自持 shared_ptr 只在最后一次回调里 reset，而该回调对每条连接/每条流**必然触发**（应用关、对端关、连接死、引擎销毁都会走它）。
+- **lsquic 对象不泄漏**：它自己管理内存，回调返回后释放；我们从不持有它，只在回调执行期间用句柄。
+- **应用持有的 wrapper 副本**：即使 on_close 后应用还握着一个 `shared_ptr`，得到的也只是"句柄已置空的死对象"——再调 `async_*` 返回 EOF / flush EOF，有守卫，不会 UAF；由应用自行释放，不算泄漏。
+
+### 正确使用约束
+
+1. 关闭走 wrapper 的公开接口（`close()` / `async_shutdown()`），让标志一致。
+2. 关闭后 `async_*` 均安全（返回 EOF），但不要再期待数据送达。
+3. 在 `on_close` / `on_conn_closed` 回调里不要阻塞、不要再去等同一对象——它们是该对象的最后一次回调。
