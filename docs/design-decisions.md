@@ -35,6 +35,27 @@
 **决策**：构造 `QuicTransportListener` 时一次性 `lsquic_global_init(LSQUIC_GLOBAL_SERVER)`。
 **依据**：完整排查记录见 [crash_report.md](crash_report.md)。
 
+### ADR-6：共享 HTTP 语义 IR + "四方 codec"
+
+**背景**：同一份代理核心要同时服务 HTTP/1.1 与 HTTP/3 客户端，且转发到 HTTP/1.1 上游。
+**决策**：共享一个协议无关的 HTTP 语义 IR（≈ RFC 9110 消息模型，即现有 `HttpRequestHead`/`HttpResponseHead`）；每个 wire 协议各自实现 parser 与 generator，做 `wire ↔ IR` 双向转换，**没有 H1→H3 直连映射器**。反代 = 四方 codec：H1Parser（客户端/上游入）、H1Generator（上游出）、H3Parser（客户端入）、H3Generator（客户端响应出）。
+**语义差异都在 codec 内部消化（不是字段拷贝）**：
+- 请求行 ↔ pseudo-headers（`:method/:path/:scheme/:authority/:status`）：H1 从请求行 + Host 派生，H3 写 pseudo-header。
+- **hop-by-hop 头**（Connection/Keep-Alive/Transfer-Encoding/Upgrade）跨协议必须剥离（RFC 9113 §8.1.2.2）——朴素映射最容易错的地方。
+- Body 帧格式：IR 的 body 是流、无帧格式；H1 去/re-chunked，H3 的 DATA 帧归传输层。
+- Trailer、Upgrade/101 各有跨协议映射（H2/3 用 Extended CONNECT 机制）。
+**后果**：新增协议 = 新增一对 codec；现有 IR 需补充 `scheme`/`authority`/`version` 一等字段（正向代理绝对 URI 必需）。
+
+### ADR-7：代理核心 = 后端选择 + 双向 relay session
+
+**背景**：反代与正代在传输层是同一件事。
+**决策**：核心抽象为一个 `RelaySession`：持有客户端流 + 后端流，把「客户端读 ↔ 后端写」「后端读 ↔ 客户端写」双向泵起来。**正反代理的唯一差异在后端选择**：
+- 反代：客户端不指明目标 → 按 Host/SNI 走路由表选后端。
+- 正代：客户端给出目标（绝对 URI 或 `CONNECT host:port`）→ 解析目标直接连。
+选择完成后两者完全相同：建立连接 → 双向泵。
+**泵的粒度**：纯隧道（CONNECT / WebSocket / 裸 TCP）按字节泵、不经 codec；HTTP 若要改写头（Host/Via/X-Forwarded-For）需按消息粒度泵（解析 → 改写 → 转发），codec 参与。
+**现状**：`ProxyCore::forward_request` 是一次性的简化版（写请求 → 读一条响应 → 关）；RelaySession 是其通用化（持久、双向、可选消息级改写）。
+
 ## 开放问题（需要决策）
 
 ### ① HTTP/3 头处理：手写帧解析 vs lsquic 原生 H3 ⭐ 最重要
@@ -55,9 +76,12 @@
 
 `ProxyCore::forward_request` 把上游的 HTTP/1.1 字节直接写回客户端流，`H3Codec::async_write_response` 从未被调用。TCP 成立，H3 下响应缺 HEADERS 帧。应在响应方向也接 codec（至少为 H3 客户端）。
 
-### ③ 上游连接复用
+### ③ 上游连接复用（keep-alive pool）
 
-当前 `UpstreamPool::async_connect` 每个请求新开一条 TCP 连接（lazy、无池）。高并发下开销大、无 keep-alive 复用。后续可加连接池 / HTTP/1.1 keep-alive / 或对支持 QUIC 的上游用 QUIC。
+当前 `UpstreamPool::async_connect` 每个请求新开一条 TCP 连接（lazy、无池），高并发下重复 TCP+TLS 握手成本高。**建议后续支持复用**，考虑点：
+- **HTTP/1.1 keep-alive**：一条连接可顺序服务多个请求 → 需要「借用/归还」池，且要处理：响应定界（无 Content-Length 时）、陈旧连接回收、每 host 连接数上限、请求串行化（H1 一条连接同时只能一个在途请求）。
+- **若后端支持 HTTP/2/3**：一条连接多路复用多条流 → 复用收益更大（N 并发请求共享一条连接），但上游也要换 codec。
+- 反代通常必须复用上游连接（Envoy/nginx 标准做法）；demo 阶段按请求新建可接受。
 
 ### ④ 多引擎水平扩展
 
