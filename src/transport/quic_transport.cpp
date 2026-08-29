@@ -471,15 +471,16 @@ QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     spdlog::debug("QUIC on_new_conn from {} (conn={})", addr,
                   reinterpret_cast<void*>(conn));
 
+    // The session owns itself via a self shared_ptr (see QuicTransportSession):
+    // after adopt_self() it stays alive until on_conn_closed releases it.
     auto session = std::make_shared<QuicTransportSession>(conn, addr);
-    session->set_listener(listener); // lets on_conn_closed reach us
+    session->adopt_self();
     auto* ctx = reinterpret_cast<lsquic_conn_ctx_t*>(session.get());
-    listener->sessions_[ctx] = std::move(session);
 
-    // Notify ProxyCore.
+    // Notify ProxyCore (passes a shared_ptr copy — the app may retain it).
     if (listener->new_session_cb_) {
         spdlog::debug("QUIC notifying ProxyCore of new session");
-        listener->new_session_cb_(listener->sessions_[ctx]);
+        listener->new_session_cb_(session);
     }
 
     return ctx;
@@ -490,17 +491,15 @@ void QuicTransportListener::on_conn_closed_cb(lsquic_conn_t* conn) {
     if (!ctx)
         return;
     auto* session = reinterpret_cast<QuicTransportSession*>(ctx);
-    auto* listener = session->listener();
-    if (!listener) {
-        session->on_closed();
-        return;
-    }
-    // Erase the session from the map, but keep a shared_ptr copy so the
-    // session outlives on_closed() — erasing is what releases the map's
-    // reference, and without this copy on_closed() would destroy `this`
-    // while still inside its own member function.
-    auto keep_alive = listener->take_session(ctx);
-    session->on_closed();
+    // This is lsquic's LAST callback for this connection: after it returns
+    // the conn is freed and the ctx is never handed back again.  Keep a copy
+    // of the self-referential shared_ptr across on_closed()/release_self()
+    // so the session is not destroyed while still inside its own member
+    // function — the copy is dropped as this callback returns, which is
+    // exactly when lsquic stops referencing the conn.
+    auto keep_alive = session->shared_from_this();
+    session->on_closed();    // mark closed, conn_ = nullptr
+    session->release_self(); // drop self-ownership; destroyed once keep_alive goes away
 }
 
 lsquic_stream_ctx_t*
@@ -612,25 +611,11 @@ void QuicTransportListener::arm_send_retry() {
 
 // ── Lookup helpers ────────────────────────────────────────
 
-QuicTransportSessionPtr
-QuicTransportListener::take_session(lsquic_conn_ctx_t* key) {
-    auto it = sessions_.find(key);
-    if (it == sessions_.end())
-        return nullptr;
-    auto session = it->second; // copy before erase keeps it alive for caller
-    sessions_.erase(it);
-    return session;
-}
-
 QuicTransportSession*
 QuicTransportListener::find_session(lsquic_conn_t* conn) {
+    // conn_ctx IS the QuicTransportSession — no registry lookup needed.
     auto* ctx = lsquic_conn_get_ctx(conn);
-    if (!ctx)
-        return nullptr;
-    auto it = sessions_.find(ctx);
-    if (it != sessions_.end())
-        return it->second.get();
-    return nullptr;
+    return reinterpret_cast<QuicTransportSession*>(ctx);
 }
 
 QuicTransportStream*

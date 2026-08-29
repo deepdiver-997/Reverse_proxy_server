@@ -17,8 +17,8 @@ QUIC 在 UDP 之上把"连接"这一层搬到了**用户态**：一个 UDP socke
 所以 QUIC 侧的 `socket_` 必须是 **listener/engine 级共享资源**，绝不能放进 `QuicTransportSession`（那是每连接视角）：
 
 ```
-QuicTransportListener (1)      socket_ (1 个 UDP fd) + engine_ + tick_timer_ + sessions_
-QuicTransportSession   (N)     conn_ + remote_addr_ + 每连接回调   ← 即 conn_ctx
+QuicTransportListener (1)      socket_ (1 个 UDP fd) + engine_ + tick_timer_
+QuicTransportSession   (N)     conn_ + remote_addr_ + 每连接回调 + self_（自持） ← 即 conn_ctx
 QuicTransportStream    (N×M)   lsquic stream 封装
 ```
 
@@ -58,7 +58,7 @@ lsquic 引擎**没有**自己的线程、socket、定时器。它只是一台状
 - `lsquic_conn_t*`：**连接本身**，库分配/管理/释放。你永远不 `new` 它，回调里拿到的是只读句柄，对它调用库函数（`lsquic_conn_close`、`lsquic_conn_make_stream`…）。
 - `lsquic_conn_ctx_t*`：**你的**每连接应用数据槽位（`struct lsquic_conn_ctx`，不透明）。你在 `on_new_conn` 里返回一个指针，引擎原样存下、在之后所有回调里原样还给你（`lsquic_conn_get_ctx`），也会出现在 `lsquic_out_spec.conn_ctx`。
 
-**把 C++ 的 `QuicTransportSession*` 直接当 conn_ctx 是标准做法**（lsquic 从不解引用它）。"每次新建"是因为每个新连接都需要一份全新的 session 状态。关键约束是**生命周期**：conn_ctx 必须在连接的最后一次回调（`on_conn_closed`）执行期间仍然有效——因此 listener 用 `sessions_` map 持有 `shared_ptr`，并在 `on_conn_closed` 里用 `take_session()` 摘除。
+**把 C++ 的 `QuicTransportSession*` 直接当 conn_ctx 是标准做法**（lsquic 从不解引用它）。"每次新建"是因为每个新连接都需要一份全新的 session 状态。关键约束是**生命周期**：conn_ctx 必须在连接的最后一次回调（`on_conn_closed`）执行期间仍然有效——因此 session **自持**一份 `shared_ptr`（`self_`，`on_new_conn` 里 `adopt_self()`），`on_conn_closed` 里先取保活拷贝、再 `release_self()`，析构发生在该回调返回之后、恰好是 lsquic 停止引用 conn 的时刻。listener 不再维护注册表。
 
 `lsquic_stream_if` 等"函数指针结构体"就是 C 语言的 vtable / 接口——回调参数里的 `self` 就是 `this`，填表即实现接口。
 
@@ -71,7 +71,7 @@ lsquic 引擎**没有**自己的线程、socket、定时器。它只是一台状
 
 ## 6. 健壮性要点（含近期修复）
 
-- `on_conn_closed_cb` 摘除 `sessions_`（防每连接泄漏），先 `take_session()` 拿一份 shared_ptr 再 `on_closed()`，避免在成员函数里销毁 `this`。
+- `on_conn_closed_cb` 是连接的最后一次回调：先 `shared_from_this()` 拿保活拷贝 → `on_closed()` → `release_self()` 释放自持，析构发生在回调返回后（避免在成员函数内销毁 `this`，也避免 lsquic 之后还引用悬垂 ctx）。
 - UDP 收包错误后要重新 `do_recv()`（瞬时错误不能杀死整个监听循环）；`operation_aborted` 表示关闭，不再 re-arm。
 - `on_packets_out` 遇 `EAGAIN/EWOULDBLOCK`：保留未发包，等 socket 可写（`socket_.async_wait(wait_write)`）再调 `lsquic_engine_send_unsent_packets()`，否则那些包永久滞留、连接最终超时。
 - `on_reset`（对端 RST 流）要及时解阻塞挂起的读写回调，避免一直等到超时。

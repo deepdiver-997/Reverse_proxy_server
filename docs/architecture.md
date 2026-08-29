@@ -63,7 +63,7 @@ client ──▶ TcpTransportListener.async_accept ──▶ TcpTransportSession
 ```
 client ──▶ QuicTransportListener（一个 UDP socket 收所有人的包）
         ──▶ lsquic_engine_packet_in：按 Connection ID 解复用
-        ──▶ on_new_conn ──▶ QuicTransportSession（挂进 sessions_ map）
+        ──▶ on_new_conn ──▶ QuicTransportSession（adopt_self() 自持所有权）
         ──▶ on_new_stream ──▶ ProxyCore.on_stream（H3Codec）
         ──▶ 路由 / 转发逻辑与 TCP 相同
 ```
@@ -78,6 +78,6 @@ QUIC 侧每一层的事件都由 lsquic 回调驱动，全程同步发生在**�
 
 ## 生命周期
 
-- `QuicTransportSession` 由 `QuicTransportListener::sessions_`（`conn_ctx → shared_ptr`）持有。
-- 连接关闭时 `on_conn_closed_cb` 通过 session 上的 listener 回指调用 `take_session()` 从 map 中摘除（先摘除、再 `on_closed()`，借助一份 shared_ptr 拷贝保活，避免在成员函数内销毁 `this`）。
+- `QuicTransportSession` **自持**一份 `shared_ptr`（`self_`，`on_new_conn` 里 `adopt_self()`）——刻意可破的循环，保证对象活到连接结束，无需 listener 维护注册表。
+- 连接关闭时 `on_conn_closed_cb`（lsquic 对该连接的最后一次回调）先 `shared_from_this()` 取保活拷贝、再 `on_closed()`、最后 `release_self()` 释放自持；析构发生在该回调返回之后（避免在成员函数内销毁 `this`，且此时 lsquic 已不再引用 conn）。
 - `QuicTransportStream` 的 ctx（`lsquic_stream_ctx_t*`）即 stream 对象自身，在构造时 `lsquic_stream_set_ctx` 设置；`on_close` 置 `stream_=nullptr`，析构时据此跳过对已释放 lsquic stream 的访问。

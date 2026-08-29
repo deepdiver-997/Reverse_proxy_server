@@ -26,8 +26,8 @@
 ### ADR-4：`QuicTransportSession*` 直接作为 `lsquic_conn_ctx_t`
 
 **背景**：lsquic 的 conn_ctx 是不透明指针，只存原样还。
-**决策**：session 即 ctx；listener 用 `sessions_` map（key=ctx）持有 shared_ptr；`on_conn_closed` 通过 session 上的 listener 回指 `take_session()` 摘除并保活。
-**后果**：免去一层 ctx 结构体；生命周期由 map + `on_conn_closed` 清理保证。
+**决策**：session 即 ctx；**session 用自持 `shared_ptr`（`self_`）承担所有权**（刻意可破的循环，非泄漏）——`on_new_conn` 里 `adopt_self()`，`on_conn_closed` 里先取 `shared_from_this()` 保活拷贝、再 `on_closed()`、最后 `release_self()`，析构发生在最后一个 lsquic 回调返回之后。
+**后果**：免去一层 ctx 结构体 + 免去 listener 的 `sessions_` 注册表；`find_session` 直接 reinterpret ctx。生命周期契约见 [transport.md §4](transport.md)。
 
 ### ADR-5：`lsquic_global_init` 必须在引擎创建前调用一次
 

@@ -10,11 +10,8 @@ extern "C" {
 #include <memory>
 #include <queue>
 #include <string>
-#include <unordered_map>
 
 namespace ebpf_quic_proxy {
-
-class QuicTransportListener; // fwd — sessions hold a back-pointer for cleanup
 
 // ── QuicTransportStream ───────────────────────────────────
 
@@ -86,18 +83,22 @@ public:
     void on_new_stream(lsquic_stream_t* lsquic_stream);
     void on_closed();
 
-    // Back-pointer to the owning listener. Needed because the static
-    // lsquic callbacks (e.g. on_conn_closed) receive only the conn_ctx and
-    // must reach the listener to drop this session from sessions_.
-    void set_listener(QuicTransportListener* l) { listener_ = l; }
-    QuicTransportListener* listener() const { return listener_; }
+    // Self-ownership: the session holds a shared_ptr to itself for the whole
+    // connection lifetime (a deliberate, breakable cycle — NOT a leak).
+    //   adopt_self()  — called by on_new_conn_cb right after make_shared.
+    //   release_self()— called by on_conn_closed_cb (after a keep-alive copy
+    //                   is taken) to drop the self-reference; the last ref
+    //                   then releases and the session is destroyed only after
+    //                   the last lsquic callback for that conn has returned.
+    void adopt_self() { self_ = shared_from_this(); }
+    void release_self() { self_.reset(); }
 
 private:
     lsquic_conn_t* conn_;
     std::string remote_addr_;
     NewStreamCallback new_stream_cb_;
     bool closed_ = false;
-    QuicTransportListener* listener_ = nullptr;
+    std::shared_ptr<QuicTransportSession> self_; // cyclic self-ownership
 };
 
 using QuicTransportSessionPtr = std::shared_ptr<QuicTransportSession>;
@@ -148,11 +149,6 @@ private:
     std::array<char, 65536> recv_buf_{};
     asio::ip::udp::endpoint recv_endpoint_;
 
-    // Active sessions (conn_ctx → QuicTransportSession).
-    // We use the conn_ctx pointer as key since lsquic gives it back in
-    // callbacks.
-    std::unordered_map<lsquic_conn_ctx_t*, QuicTransportSessionPtr> sessions_;
-
     void do_recv();
     void on_packet(asio::error_code ec, std::size_t n);
     void schedule_tick();
@@ -162,10 +158,6 @@ private:
     // flush lsquic's unsent packets once the socket drains.
     void arm_send_retry();
     bool send_retry_armed_ = false;
-
-    /// Erase a session from sessions_ by its conn_ctx key and return it,
-    /// so callers can keep it alive across a cleanup callback.
-    QuicTransportSessionPtr take_session(lsquic_conn_ctx_t* key);
 
     // ── lsquic callbacks ──────────────────────────────────
     static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
