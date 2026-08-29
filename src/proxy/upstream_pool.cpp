@@ -8,33 +8,57 @@ UpstreamPool::UpstreamPool(asio::io_context& io) : io_(io) {}
 
 void UpstreamPool::add_backend(const BackendEndpoint& be) {
     std::lock_guard lock(mutex_);
-    endpoints_.push_back(be);
+    endpoints_.push_back(EndpointEntry{be, {}});
 }
 
 void UpstreamPool::async_connect(const std::string& backend_id,
-                                  ConnectCallback cb) {
+                                 ConnectCallback cb) {
     // Find all endpoints for this backend_id.
-    std::vector<BackendEndpoint> candidates;
+    std::vector<EndpointEntry*> candidates;
     {
         std::lock_guard lock(mutex_);
-        for (const auto& ep : endpoints_) {
-            if (ep.backend_id == backend_id)
-                candidates.push_back(ep);
-        }
+        for (auto& e : endpoints_)
+            if (e.be.backend_id == backend_id)
+                candidates.push_back(&e);
     }
 
     if (candidates.empty()) {
-        cb(asio::error::not_found, nullptr);
+        cb(asio::error::not_found, nullptr, {}, false);
         return;
     }
 
-    // Round-robin pick.
-    // Can be replaced with atomic fetch_add if we want to avoid the mutex, but this is simpler for the mvp
+    // Round-robin pick among the group's endpoints.
     std::size_t idx = rr_index_.fetch_add(1) % candidates.size();
-    const auto& target = candidates[idx];
+    auto* entry = candidates[idx];
 
-    spdlog::debug("connecting to backend {} at {}:{}", backend_id, target.host,
-                  target.port);
+    // Prefer a pooled idle connection over a fresh handshake.
+    ITransportStreamPtr idle;
+    {
+        std::lock_guard lock(mutex_);
+        if (!entry->idle.empty()) {
+            idle = std::move(entry->idle.front());
+            entry->idle.pop_front();
+        }
+    }
+    if (idle) {
+        spdlog::debug("reusing idle backend connection to {}:{}",
+                      entry->be.host, entry->be.port);
+        cb({}, std::move(idle), entry->be, /*from_pool=*/true);
+        return;
+    }
+
+    connect_fresh_to(entry->be, std::move(cb));
+}
+
+void UpstreamPool::async_connect_fresh(const BackendEndpoint& endpoint,
+                                       ConnectCallback cb) {
+    connect_fresh_to(endpoint, std::move(cb));
+}
+
+void UpstreamPool::connect_fresh_to(const BackendEndpoint& target,
+                                    ConnectCallback cb) {
+    spdlog::debug("connecting to backend {} at {}:{}", target.backend_id,
+                  target.host, target.port);
 
     // Resolve + connect.
     asio::ip::tcp::resolver resolver(io_);
@@ -43,17 +67,32 @@ void UpstreamPool::async_connect(const std::string& backend_id,
     auto socket = std::make_shared<asio::ip::tcp::socket>(io_);
     asio::async_connect(
         *socket, endpoints,
-        [socket, cb = std::move(cb)](asio::error_code ec,
-                                       auto /*endpoint*/) mutable {
+        [socket, cb = std::move(cb),
+         target](asio::error_code ec, auto /*endpoint*/) mutable {
             if (ec) {
                 spdlog::warn("backend connect failed: {}", ec.message());
-                cb(ec, nullptr);
+                cb(ec, nullptr, target, false);
                 return;
             }
             auto stream =
                 std::make_shared<TcpTransportStream>(std::move(*socket));
-            cb({}, stream);
+            cb({}, std::move(stream), target, /*from_pool=*/false);
         });
+}
+
+void UpstreamPool::release(const BackendEndpoint& endpoint,
+                           ITransportStreamPtr stream) {
+    std::lock_guard lock(mutex_);
+    for (auto& e : endpoints_) {
+        if (e.be.backend_id == endpoint.backend_id &&
+            e.be.host == endpoint.host && e.be.port == endpoint.port) {
+            if (e.idle.size() < kMaxIdlePerEndpoint)
+                e.idle.push_back(std::move(stream));
+            // else: drop — the shared_ptr release closes the socket.
+            return;
+        }
+    }
+    // Unknown endpoint — dropping the ref closes the connection.
 }
 
 } // namespace ebpf_quic_proxy

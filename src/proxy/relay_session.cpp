@@ -47,31 +47,66 @@ void RelaySession::request_phase() {
                 backend_id,
                 [this, self, head = std::move(head),
                  body = std::move(body)](asio::error_code ec,
-                                         ITransportStreamPtr upstream) mutable {
+                                         ITransportStreamPtr upstream,
+                                         const BackendEndpoint& endpoint,
+                                         bool from_pool) mutable {
                     if (ec) {
                         spdlog::warn("upstream connect failed: {}", ec.message());
                         write_error(HttpStatus::BadGateway, "upstream unreachable\n");
                         return;
                     }
                     backend_ = std::move(upstream);
-                    send_backend_request(std::move(head), std::move(body));
+                    backend_endpoint_ = endpoint;
+                    backend_from_pool_ = from_pool;
+                    pending_head_ =
+                        std::make_shared<HttpRequestHead>(std::move(head));
+                    pending_body_ = std::move(body);
+                    send_backend_request(/*retry_allowed=*/true);
                 });
         });
 }
 
-void RelaySession::send_backend_request(HttpRequestHead head, BodySourcePtr body) {
+void RelaySession::send_backend_request(bool retry_allowed) {
     auto self = shared_from_this();
     backend_codec_->async_write_request(
-        backend_, std::move(head), std::move(body),
-        [this, self](asio::error_code ec) {
+        backend_, *pending_head_, pending_body_,
+        [this, self, retry_allowed](asio::error_code ec) {
             if (ec) {
                 spdlog::warn("relay: backend request write failed: {}",
                              ec.message());
+                // A pooled connection may be stale (backend closed it while
+                // idle).  Retry once on a fresh connection — but only with no
+                // request body, since a partially-consumed body can't replay.
+                if (retry_allowed && backend_from_pool_ && !pending_body_) {
+                    spdlog::debug("relay: pooled backend stale — reconnecting fresh");
+                    reconnect_backend_fresh();
+                    return;
+                }
                 close_backend();
                 write_error(HttpStatus::BadGateway, "backend write error\n");
                 return;
             }
+            pending_head_.reset();
+            pending_body_.reset();
             response_phase();
+        });
+}
+
+void RelaySession::reconnect_backend_fresh() {
+    auto self = shared_from_this();
+    close_backend();
+    pool_->async_connect_fresh(
+        backend_endpoint_,
+        [this, self](asio::error_code ec, ITransportStreamPtr upstream,
+                     const BackendEndpoint& endpoint, bool) {
+            if (ec) {
+                write_error(HttpStatus::BadGateway, "upstream unreachable\n");
+                return;
+            }
+            backend_ = std::move(upstream);
+            backend_endpoint_ = endpoint;
+            backend_from_pool_ = false;
+            send_backend_request(/*retry_allowed=*/false); // one retry only
         });
 }
 
@@ -80,7 +115,7 @@ void RelaySession::response_phase() {
     backend_codec_->async_parse_response(
         backend_,
         [this, self](asio::error_code ec, HttpResponseHead resp,
-                     BodySourcePtr resp_body, bool /*backend_keep_alive*/) {
+                     BodySourcePtr resp_body, bool backend_keep_alive) {
             if (ec) {
                 spdlog::warn("relay: backend response parse failed: {}",
                              ec.message());
@@ -94,11 +129,25 @@ void RelaySession::response_phase() {
                 resp_body = nullptr;
             client_codec_->async_write_response(
                 client_, std::move(resp), std::move(resp_body),
-                [this, self](asio::error_code) {
-                    close_backend();
+                [this, self, backend_keep_alive](asio::error_code) {
+                    finish_backend(backend_keep_alive);
                     after_client_response();
                 });
         });
+}
+
+void RelaySession::finish_backend(bool keep_alive) {
+    pending_head_.reset();
+    pending_body_.reset();
+    if (!backend_)
+        return;
+    if (keep_alive) {
+        spdlog::debug("relay: returning backend {}:{} to pool",
+                      backend_endpoint_.host, backend_endpoint_.port);
+        pool_->release(backend_endpoint_, std::move(backend_));
+    } else {
+        close_backend();
+    }
 }
 
 void RelaySession::close_backend() {
@@ -109,11 +158,11 @@ void RelaySession::close_backend() {
 }
 
 void RelaySession::after_client_response() {
-    // Step 1: the backend connection is closed per request; only the client
-    // connection may persist (H1 keep-alive). Step 2 will return the backend
-    // to a pool instead of closing it.
+    // The backend connection is now pooled or closed (finish_backend).  The
+    // client connection may persist (H1 keep-alive) — loop back for the next
+    // request.
     if (client_keep_alive_ && !done_)
-        request_phase(); // loop: parse the next request on this connection
+        request_phase();
     else
         teardown();
 }

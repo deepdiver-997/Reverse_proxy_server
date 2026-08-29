@@ -54,9 +54,16 @@ private:
             }
             size_line_.clear();
             chunk_remaining_ = static_cast<std::size_t>(sz);
-            if (chunk_remaining_ == 0) { // last-chunk → body exhausted
-                finished_ = true;
-                cb({}, 0);
+            if (chunk_remaining_ == 0) { // last-chunk → consume trailers
+                read_trailers([this, self, cb](bool ok) mutable {
+                    if (!ok) {
+                        finished_ = true;
+                        cb(asio::error::eof, 0);
+                        return;
+                    }
+                    finished_ = true;
+                    cb({}, 0); // body exhausted
+                });
                 return;
             }
             read_chunk_payload(buf, std::move(cb));
@@ -120,6 +127,23 @@ private:
                     size_line_.push_back(b[0]);
                 read_line_byte(std::move(done));
             });
+    }
+
+    // Trailer section follows the 0-chunk: header lines terminated by a blank
+    // line.  Skip them so a keep-alive connection is left at a clean boundary
+    // (required before returning the connection to the pool).
+    void read_trailers(std::function<void(bool)> done) {
+        read_line([this, done](bool ok) {
+            if (!ok) {
+                done(false);
+                return;
+            }
+            if (size_line_.empty()) { // blank line ends the trailer section
+                done(true);
+                return;
+            }
+            read_trailers(std::move(done));
+        });
     }
 
     // Reads exactly `count` bytes, discarding them (skips a CRLF).

@@ -94,11 +94,12 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 
 `RelaySession`（ADR-7）让响应方向走 codec：后端 codec 解析响应 → 客户端 codec 写回。H1 响应（CL/chunked/close-delimited）已实现；H3 响应走 `H3Codec::async_write_response` → `lsquic_stream_send_headers` + DATA body（ADR-8）。
 
-### ③ 上游连接复用（keep-alive pool）
+### ③ 上游连接复用（keep-alive pool）✅ Step 1 + Step 2 已完成
 
-**Step 1 已完成**：客户端 H1 keep-alive（`RelaySession` 相位机按 `keep_alive` 回环）。**Step 2 待做**：`RelaySession::close_backend()` 目前每请求关闭后端连接，改为归还连接池。
+- **Step 1**：客户端 H1 keep-alive（`RelaySession` 相位机按 `keep_alive` 回环）。
+- **Step 2**：后端连接池。`UpstreamPool` 增加 `release()`（归还空闲连接 + 每 endpoint 上限 8）与 `async_connect_fresh()`；`async_connect` 优先复用空闲连接。`RelaySession::finish_backend` 按后端响应的 `keep_alive` 决定归还池还是关闭。陈旧池连接（后端空闲时关闭）在写入失败时用新鲜连接**重试一次**（仅无请求体时）。chunked 响应已消费 trailer 段，保证归还的连接处于干净边界。
 
-当前 `UpstreamPool::async_connect` 每个请求新开一条 TCP 连接（lazy、无池），高并发下重复 TCP+TLS 握手成本高。**建议后续支持复用**，考虑点：
+剩余考虑点：
 - **HTTP/1.1 keep-alive**：一条连接可顺序服务多个请求 → 需要「借用/归还」池，且要处理：响应定界（无 Content-Length 时）、陈旧连接回收、每 host 连接数上限、请求串行化（H1 一条连接同时只能一个在途请求）。
 - **若后端支持 HTTP/2/3**：一条连接多路复用多条流 → 复用收益更大（N 并发请求共享一条连接），但上游也要换 codec。
 - 反代通常必须复用上游连接（Envoy/nginx 标准做法）；demo 阶段按请求新建可接受。
