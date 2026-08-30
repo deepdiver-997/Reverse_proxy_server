@@ -15,14 +15,17 @@ namespace ebpf_quic_proxy {
 
 class ProxyCore {
 public:
-    ProxyCore(asio::io_context& io, const ProxyConfig& cfg);
+    /// `reuse_port` (Model B): listeners set SO_REUSEPORT so several ProxyCore
+    /// units can share the same ports; the kernel distributes connections.
+    ProxyCore(asio::io_context& io, const ProxyConfig& cfg,
+              bool reuse_port = false);
 
     /// Start TCP listener.  Does not block — runs on the io_context.
     void start_tcp();
 
     /// Start QUIC listener.  Requires TLS cert/key.
     void start_quic(uint16_t port, const std::string& cert_file,
-                    const std::string& key_file);
+                    const std::string& key_file, bool reuse_port = false);
 
 private:
     void do_accept();

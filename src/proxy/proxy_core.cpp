@@ -8,7 +8,8 @@
 namespace ebpf_quic_proxy {
 
 
-ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
+ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg,
+                     bool reuse_port)
     : io_(io),
       h1_codec_(std::make_unique<H1Codec>()),
       h3_codec_(std::make_unique<H3Codec>()),
@@ -18,7 +19,7 @@ ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     auto ep = asio::ip::tcp::endpoint(
         asio::ip::make_address(cfg.listen_addr), cfg.listen_port);
     tcp_listener_ =
-        std::make_shared<TcpTransportListener>(io, ep);
+        std::make_shared<TcpTransportListener>(io, ep, reuse_port);
 
     // Build router.
     for (const auto& r : cfg.routes)
@@ -36,12 +37,12 @@ ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
 void ProxyCore::start_tcp() { do_accept(); }
 
 void ProxyCore::start_quic(uint16_t port, const std::string& cert_file,
-                            const std::string& key_file) {
+                            const std::string& key_file, bool reuse_port) {
     // Server TLS ctx: created ONCE here (single-threaded startup) and injected
     // — immutable after setup, safe to share read-only across listener threads.
     auto ssl_ctx = make_server_ssl_ctx(cert_file, key_file);
-    quic_listener_ =
-        std::make_unique<QuicTransportListener>(io_, port, std::move(ssl_ctx));
+    quic_listener_ = std::make_unique<QuicTransportListener>(
+        io_, port, std::move(ssl_ctx), reuse_port);
 
     quic_listener_->set_new_session_cb(
         [this](QuicTransportSessionPtr session) {

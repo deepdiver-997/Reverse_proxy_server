@@ -213,9 +213,11 @@ public:
 
     /// Create a QUIC listener bound to `port`, using the injected server TLS
     /// context (created once by make_server_ssl_ctx — externally held, so no
-    /// per-instance cert loading and no shared static).
-    QuicTransportListener(asio::io_context& io, uint16_t port,
-                          SslCtxPtr ssl_ctx);
+    /// per-instance cert loading and no shared static).  `reuse_port` (Model B)
+    /// sets SO_REUSEPORT before bind so several listeners share the port and
+    /// the kernel distributes datagrams by 4-tuple (connection affinity).
+    QuicTransportListener(asio::io_context& io, uint16_t port, SslCtxPtr ssl_ctx,
+                          bool reuse_port = false);
     ~QuicTransportListener();
 
     /// Register callback for new QUIC sessions.

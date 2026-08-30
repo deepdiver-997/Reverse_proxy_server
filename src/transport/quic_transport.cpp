@@ -11,6 +11,7 @@ extern "C" {
 #include <cstring>
 #include <mutex>
 #include <sstream>
+#include <sys/socket.h>
 
 namespace ebpf_quic_proxy {
 
@@ -697,14 +698,26 @@ static const struct lsquic_stream_if kClientStreamIf = {
 
 QuicTransportListener::QuicTransportListener(asio::io_context& io,
                                              uint16_t port,
-                                             SslCtxPtr ssl_ctx)
+                                             SslCtxPtr ssl_ctx,
+                                             bool reuse_port)
     : io_(io),
-      socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v4(), port)),
+      socket_(io),
       tick_timer_(io),
-      raw_fd_(socket_.native_handle()),
       ssl_ctx_(std::move(ssl_ctx)) {
 
     ensure_quic_global_init();
+
+    // Open unbound, set SO_REUSEPORT BEFORE bind (must precede bind): with
+    // Model B several listeners share the port and the kernel distributes
+    // datagrams by 4-tuple, giving each connection a fixed engine.
+    socket_.open(asio::ip::udp::v4());
+    if (reuse_port) {
+        int on = 1;
+        ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_REUSEPORT, &on,
+                     sizeof(on));
+    }
+    socket_.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
+    raw_fd_ = socket_.native_handle();
 
     struct lsquic_engine_api api = {};
     api.ea_hsi_if          = &kHsiIf;

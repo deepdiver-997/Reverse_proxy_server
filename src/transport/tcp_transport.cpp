@@ -1,5 +1,6 @@
 #include "tcp_transport.h"
 #include <sstream>
+#include <sys/socket.h>
 
 namespace ebpf_quic_proxy {
 
@@ -73,9 +74,19 @@ std::string TcpTransportSession::remote_addr() const { return remote_addr_; }
 
 TcpTransportListener::TcpTransportListener(
     asio::io_context& io,
-    const asio::ip::tcp::endpoint& ep)
-    : acceptor_(io, ep) {
-    acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
+    const asio::ip::tcp::endpoint& ep,
+    bool reuse_port)
+    : acceptor_(io) {
+    // Open unbound, set options BEFORE bind (SO_REUSEPORT must be set first).
+    acceptor_.open(ep.protocol());
+    int on = 1;
+    ::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_REUSEADDR, &on,
+                 sizeof(on));
+    if (reuse_port)
+        ::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_REUSEPORT, &on,
+                     sizeof(on));
+    acceptor_.bind(ep);
+    acceptor_.listen();
 }
 
 void TcpTransportListener::async_accept(AcceptCallback cb) {
