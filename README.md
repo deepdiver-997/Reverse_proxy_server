@@ -8,9 +8,12 @@
 
 - **双协议监听**：同一个 `ProxyCore` 同时挂 TCP 与 QUIC 两个监听器，按传输协议自动选择编解码器。
 - **传输抽象**：`ITransportSession` / `ITransportStream` 屏蔽 TCP/QUIC 差异，`ICodec` 屏蔽 H1/H3 差异。
-- **基于主机的路由** + **后端轮询**（upstream pool）。
+- **基于主机的路由** + **后端 keep-alive 连接池**（轮询 + 空闲复用）。
+- **正向代理**：absolute-form 目标（`GET http://host/path`）直连 URL authority；https 走 `CONNECT` 隧道。
+- **字节桥隧道**：CONNECT 与 WebSocket Upgrade（101）切原始字节双向泵，完全绕过 codec。
+- **完整四方 codec**：H1/H3 请求/响应解析与序列化（H3 上游 codec 已就绪，待 QUIC client 引擎）。
 - **lsquic + BoringSSL**：内嵌 vendored 依赖，无需系统级 QUIC 栈。
-- 请求/响应转发逻辑与传输解耦，便于后续扩展 WebSocket、gRPC 等。
+- 请求/响应转发逻辑与传输解耦，便于后续扩展 gRPC 等。
 
 ## 目录结构
 

@@ -44,7 +44,7 @@
 - **hop-by-hop 头**（Connection/Keep-Alive/Transfer-Encoding/Upgrade）跨协议必须剥离（RFC 9113 §8.1.2.2）——朴素映射最容易错的地方。
 - Body 帧格式：IR 的 body 是流、无帧格式；H1 去/re-chunked，H3 的 DATA 帧归传输层。
 - Trailer、Upgrade/101 各有跨协议映射（H2/3 用 Extended CONNECT 机制）。
-**后果**：新增协议 = 新增一对 codec；现有 IR 需补充 `scheme`/`authority`/`version` 一等字段（正向代理绝对 URI 必需）。
+**后果**：新增协议 = 新增一对 codec；IR 已补 `scheme`/`authority`/`absolute_target` 一等字段（正向代理 absolute-form 与 H3 上游序列化必需）；`version` 仍待加。
 
 ### ADR-7：代理核心 = 后端选择 + 双向 relay session
 
@@ -55,7 +55,11 @@
 选择完成后两者完全相同：建立连接 → 双向泵。
 **泵的粒度**：纯隧道（CONNECT / WebSocket / 裸 TCP）按字节泵、不经 codec；HTTP 若要改写头（Host/Via/X-Forwarded-For）需按消息粒度泵（解析 → 改写 → 转发），codec 参与。
 **现状（已实现）**：RelaySession 为**相位机**（Request → 路由 + 连接后端 → Response → 按 codec 的 `keep_alive` 回环或关闭）。`ICodec` 解析回调带 `keep_alive` 标志——由内容决定（H1 按 Connection/版本/body 定界算；H3 流恒 false，连接在 session 层持续）。客户端 H1 keep-alive ✅、后端连接池 ✅。
-**CONNECT 字节桥（已实现）**：`request_phase` 检测 `CONNECT host:port` → 直连目标（绕过路由表）→ 200 → **Bridge 模式**：两个独立事件驱动字节泵（client ⇄ target）直到任一端关闭。这就是"真正的管道"，也是正向代理 HTTPS 的地基。WebSocket 的 Upgrade 检测尚未接（当前只识别显式 CONNECT）。
+**CONNECT 字节桥（已实现）**：`request_phase` 检测 `CONNECT host:port` → 直连目标（绕过路由表）→ 200 → **Bridge 模式**：两个独立事件驱动字节泵（client ⇄ target）直到任一端关闭。这就是"真正的管道"，也是正向代理 HTTPS 的地基。
+
+**WebSocket Upgrade 字节桥（已实现）**：识别 `Connection: Upgrade` + `Upgrade` 请求 → 正常转发 → 后端回 **101** → 同样切 Bridge 模式（升级后的连接绝不再回连接池）。H1-only——HTTP/3 的 WebSocket 需 RFC 9220 Extended CONNECT，未做。
+
+**正向代理 absolute-form（已实现）**：客户端用 absolute-form 目标（`GET http://host/path`）→ `request_phase` 解析 URL 的 scheme/authority → `async_connect_fresh` 直连目标（跳过路由表）→ 转发 origin-form 请求。https absolute-form 拒绝（400，提示走 CONNECT）。至此「正反代理唯一差异在后端选择」两块都落地。
 
 **RelaySession 骨架**：
 ```cpp
@@ -83,7 +87,8 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 - `QuicTransportListener` 的 HSI 已实现（`QuicH3HeaderSet`：QPACK 解码缓冲 + 头部收集，`hsi_create/prepare_decode/process/discard`），假 HSI 已移除。
 - `QuicTransportStream` 新增 `async_take_headers`（`lsquic_stream_get_hset` 认领解码头 → IR）与 `async_send_headers`（`lsquic_stream_send_headers`），`on_readable` 优先投递解码头。
 - `H3Codec::async_parse_request` 走 transport 解码头 → IR，body 为 DATA 读到 FIN；`async_write_response` 走 `send_headers` + body 泵。手写帧解析状态机已移除（varint + `h3_detail::parse_request_headers` 工具保留，仍有单测）。
-- **未接**：H3 上游（`async_parse_response`/`async_write_request`）——后端仍是 HTTP/1.1，这两个保持 `operation_not_supported` 占位。
+- **四方 codec 已补全**：`H3Codec::async_parse_response`/`async_write_request` 已实现（纯 codec 层）。同时 transport 改为返回**原始解码头列表**（含 pseudo-header），请求/响应的 IR 解释收敛到 codec（`request_head_from_headers`/`response_head_from_headers`），`async_parse_response` 因此复用同一套 QPACK 解码机制。H3 写路径统一剥离 hop-by-hop 头（RFC 9113 §8.1.2.2）。
+- **未接**：H3 **上游连接**——真正把请求发到 HTTP/3 后端需要 lsquic **客户端**引擎 + QUIC 后端池，是独立工程。codec 已就绪，接上即用。
 
 ## 开放问题（需要决策）
 
