@@ -2,12 +2,16 @@
 
 #include "config.h"
 #include "transport/itransport_stream.h"
+#include "transport/quic_transport.h"
 #include <asio.hpp>
 #include <atomic>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace ebpf_quic_proxy {
@@ -15,6 +19,9 @@ namespace ebpf_quic_proxy {
 /// Manages backend endpoints and connections to them.
 /// Phase 1: round-robin, lazy-connect.  Step 2: keep-alive pool — idle
 /// connections are returned via release() and reused on the next checkout.
+/// H3 upstreams (endpoint.protocol == QUIC) are reached through a
+/// QuicClientEngine whose established connections are reused by opening a new
+/// stream per request (multiplexing) instead of serialized TCP keep-alive.
 class UpstreamPool {
 public:
     /// Connect callback.  `endpoint` is the chosen backend endpoint;
@@ -28,8 +35,10 @@ public:
 
     void add_backend(const BackendEndpoint& be);
 
-    /// Open (or check out an idle) TCP connection to a backend in
-    /// `backend_id` group.  Round-robins among that group's endpoints.
+    /// Open (or check out an idle) connection to a backend in `backend_id`
+    /// group.  Round-robins among that group's endpoints; TCP uses the
+    /// keep-alive pool, QUIC (protocol == QUIC) opens a stream on a reused
+    /// client connection.
     void async_connect(const std::string& backend_id, ConnectCallback cb);
 
     /// Connect to a specific endpoint, always fresh (skips the idle queue).
@@ -39,6 +48,8 @@ public:
 
     /// Return an idle keep-alive connection to the pool for reuse.
     /// Drops the connection if the per-endpoint idle limit is reached.
+    /// No-op for QUIC endpoints — H3 streams are one-shot; the connection
+    /// stays pooled on its own.
     void release(const BackendEndpoint& endpoint, ITransportStreamPtr stream);
 
 private:
@@ -48,6 +59,28 @@ private:
     };
 
     void connect_fresh_to(const BackendEndpoint& target, ConnectCallback cb);
+
+    // ── QUIC (H3 upstream) path ───────────────────────────
+    void quic_connect(const BackendEndpoint& ep, ConnectCallback cb);
+    void quic_connect_fresh(const BackendEndpoint& ep, ConnectCallback cb);
+    /// Called synchronously from QuicClientEngine::connect's on_new_conn:
+    /// `session` just arrived; open its first stream.
+    void on_client_conn(QuicTransportSessionPtr session);
+    void open_quic_stream(QuicTransportSessionPtr session,
+                          const BackendEndpoint& ep, bool from_pool,
+                          ConnectCallback cb);
+    void remove_quic_conn(const BackendEndpoint& ep,
+                          QuicTransportSession* raw);
+
+    struct PendingQuic {
+        BackendEndpoint endpoint;
+        ConnectCallback cb;
+    };
+
+    std::unique_ptr<QuicClientEngine> quic_engine_;
+    std::optional<PendingQuic> pending_quic_; // consumed by on_client_conn
+    /// Established client connections per upstream (key "host:port").
+    std::map<std::string, std::deque<QuicTransportSessionPtr>> quic_conns_;
 
     asio::io_context& io_;
     std::vector<EndpointEntry> endpoints_;

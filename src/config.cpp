@@ -38,6 +38,10 @@ ProxyConfig load_config(const std::string& path) {
                 be.host = toml::find<std::string>(v, "host");
                 be.port = toml::find<int>(v, "port");
                 be.weight = toml::find_or<int>(v, "weight", 1);
+                be.protocol =
+                    (toml::find_or<std::string>(v, "protocol", "h1") == "h3")
+                        ? TransportProtocol::QUIC
+                        : TransportProtocol::TCP;
                 cfg.backends.push_back(std::move(be));
             }
         }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "transport/itransport_session.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -11,6 +12,9 @@ struct BackendEndpoint {
     std::string host;
     uint16_t port;
     int weight = 1;
+    /// How the proxy reaches this backend: TCP = HTTP/1.1, QUIC = HTTP/3
+    /// (config: `protocol = "h1"` default, `"h3"` for an HTTP/3 upstream).
+    TransportProtocol protocol = TransportProtocol::TCP;
 };
 
 struct RouteRule {
