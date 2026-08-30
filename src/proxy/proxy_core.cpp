@@ -12,7 +12,7 @@ ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     : io_(io),
       h1_codec_(std::make_unique<H1Codec>()),
       h3_codec_(std::make_unique<H3Codec>()),
-      upstream_pool_(io) {
+      upstream_pool_(io, make_client_ssl_ctx()) {
 
     // Build TCP listener.
     auto ep = asio::ip::tcp::endpoint(
@@ -37,8 +37,11 @@ void ProxyCore::start_tcp() { do_accept(); }
 
 void ProxyCore::start_quic(uint16_t port, const std::string& cert_file,
                             const std::string& key_file) {
-    quic_listener_ = std::make_unique<QuicTransportListener>(
-        io_, port, cert_file, key_file);
+    // Server TLS ctx: created ONCE here (single-threaded startup) and injected
+    // — immutable after setup, safe to share read-only across listener threads.
+    auto ssl_ctx = make_server_ssl_ctx(cert_file, key_file);
+    quic_listener_ =
+        std::make_unique<QuicTransportListener>(io_, port, std::move(ssl_ctx));
 
     quic_listener_->set_new_session_cb(
         [this](QuicTransportSessionPtr session) {

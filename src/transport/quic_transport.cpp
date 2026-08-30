@@ -9,6 +9,7 @@ extern "C" {
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 
 namespace ebpf_quic_proxy {
@@ -373,22 +374,90 @@ void QuicTransportSession::on_closed() {
 // Shared glue — role-agnostic helpers and lsquic callbacks
 // ═══════════════════════════════════════════════════════════
 
-namespace {
+// ═══════════════════════════════════════════════════════════
+// TLS contexts — created ONCE, externally held, injected into the engines
+// ═══════════════════════════════════════════════════════════
 
-/// One-time global QUIC/TLS init.  Needs BOTH roles: the server engine and the
-/// client engine coexist in this process (and the client engine may be created
-/// without a QUIC listener ever existing).
 void ensure_quic_global_init() {
-    static bool s_inited = false;
-    if (s_inited)
-        return;
-    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER | LSQUIC_GLOBAL_CLIENT)) {
-        spdlog::error("QUIC: lsquic_global_init failed");
-        throw std::runtime_error("lsquic_global_init");
-    }
-    s_inited = true;
-    spdlog::info("QUIC global init done (server + client)");
+    // std::call_once BLOCKS all callers until the first init finishes — a bare
+    // "already started?" flag would let a second thread return before the
+    // (multi-step) init completed.
+    static std::once_flag s_once;
+    std::call_once(s_once, [] {
+        if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER |
+                                    LSQUIC_GLOBAL_CLIENT)) {
+            spdlog::error("QUIC: lsquic_global_init failed");
+            throw std::runtime_error("lsquic_global_init");
+        }
+        spdlog::info("QUIC global init done (server + client)");
+    });
 }
+
+SslCtxPtr make_server_ssl_ctx(const std::string& cert_file,
+                              const std::string& key_file) {
+    ensure_quic_global_init();
+    if (cert_file.empty() || key_file.empty()) {
+        spdlog::warn("QUIC: no cert/key configured, TLS won't work");
+        return nullptr;
+    }
+
+    auto* raw = SSL_CTX_new(TLS_method());
+    if (!raw) {
+        spdlog::error("QUIC: SSL_CTX_new failed");
+        return nullptr;
+    }
+    SslCtxPtr ctx(raw, SSL_CTX_free);
+
+    if (SSL_CTX_use_certificate_chain_file(ctx.get(), cert_file.c_str()) != 1) {
+        spdlog::error("QUIC: failed to load cert file: {}", cert_file);
+        return nullptr;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx.get(), key_file.c_str(),
+                                    SSL_FILETYPE_PEM) != 1) {
+        spdlog::error("QUIC: failed to load key file: {}", key_file);
+        return nullptr;
+    }
+
+    // QUIC requires TLS 1.3.
+    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
+
+    // ALPN protocol list (length-prefixed wire format): H3 and H3-29.
+    static const char kQuicAlpn[] = "\x02h3\x05h3-29";
+    SSL_CTX_set_alpn_select_cb(
+        ctx.get(),
+        [](SSL*, const unsigned char** out, unsigned char* outlen,
+           const unsigned char* in, unsigned int inlen, void*) {
+            static const unsigned char kAlpn[] = "\x02h3\x05h3-29";
+            int r = SSL_select_next_proto(
+                const_cast<unsigned char**>(out), outlen, in, inlen, kAlpn,
+                sizeof(kAlpn) - 1);
+            if (r == OPENSSL_NPN_NEGOTIATED)
+                return SSL_TLSEXT_ERR_OK;
+            spdlog::warn("QUIC: no supported ALPN from {:.{}}",
+                         reinterpret_cast<const char*>(in), inlen);
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
+        },
+        nullptr);
+    spdlog::info("QUIC server TLS ctx ready: {}", cert_file);
+    return ctx;
+}
+
+SslCtxPtr make_client_ssl_ctx() {
+    ensure_quic_global_init();
+    auto* raw = SSL_CTX_new(TLS_method());
+    if (!raw) {
+        spdlog::error("QUIC: client SSL_CTX_new failed");
+        return nullptr;
+    }
+    SslCtxPtr ctx(raw, SSL_CTX_free);
+    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
+    // No cert verification: ea_verify_cert stays NULL (the curl -k equivalent).
+    return ctx;
+}
+
+namespace {
 
 // ── address helpers ───────────────────────────────────────
 
@@ -628,19 +697,14 @@ static const struct lsquic_stream_if kClientStreamIf = {
 
 QuicTransportListener::QuicTransportListener(asio::io_context& io,
                                              uint16_t port,
-                                             const std::string& cert_file,
-                                             const std::string& key_file)
+                                             SslCtxPtr ssl_ctx)
     : io_(io),
       socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v4(), port)),
       tick_timer_(io),
-      raw_fd_(socket_.native_handle()) {
+      raw_fd_(socket_.native_handle()),
+      ssl_ctx_(std::move(ssl_ctx)) {
 
     ensure_quic_global_init();
-
-    // Load TLS certificate.
-    cert_file_ = cert_file;
-    key_file_  = key_file;
-    load_tls_cert();
 
     struct lsquic_engine_api api = {};
     api.ea_hsi_if          = &kHsiIf;
@@ -672,12 +736,7 @@ QuicTransportListener::~QuicTransportListener() {
         lsquic_engine_destroy(engine_);
         engine_ = nullptr;
     }
-    if (ssl_ctx_) {
-        auto* ctx = ssl_ctx_;
-        ssl_ctx_ = nullptr;
-        s_ssl_ctx_ = nullptr;
-        SSL_CTX_free(ctx);
-    }
+    // ssl_ctx_ is a shared_ptr — released here (last holder frees the SSL_CTX).
 }
 
 void QuicTransportListener::set_new_session_cb(NewSessionCallback cb) {
@@ -722,8 +781,8 @@ void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
         engine_, reinterpret_cast<const unsigned char*>(recv_buf_.data()), n,
         reinterpret_cast<const struct sockaddr*>(&local_sa),
         reinterpret_cast<const struct sockaddr*>(&peer_sa),
-        nullptr, // conn_ctx — NULL is fine, we find sessions via stream_if_ctx
-        0        // ecn
+        this, // conn_ctx -> the conn's peer_ctx; get_ssl_ctx_cb reads it back
+        0     // ecn
     );
 
     if (r < 0) {
@@ -822,67 +881,12 @@ void QuicTransportListener::arm_send_retry() {
         });
 }
 
-// ── TLS cert loading ──────────────────────────────────────
-
-// ALPN protocol list (length-prefixed wire format).
-// Supports H3 (HTTP/3) and H3-29 (older draft for compatibility).
-static const char kQuicAlpn[] = "\x02h3\x05h3-29";
-
-static int select_alpn_cb(SSL* ssl, const unsigned char** out,
-                          unsigned char* outlen, const unsigned char* in,
-                          unsigned int inlen, void* /*arg*/) {
-    int r = SSL_select_next_proto(const_cast<unsigned char**>(out), outlen,
-                                  in, inlen,
-                                  reinterpret_cast<const unsigned char*>(kQuicAlpn),
-                                  sizeof(kQuicAlpn) - 1);
-    if (r == OPENSSL_NPN_NEGOTIATED)
-        return SSL_TLSEXT_ERR_OK;
-    spdlog::warn("QUIC: no supported ALPN from {:.{}}",
-                 reinterpret_cast<const char*>(in), inlen);
-    return SSL_TLSEXT_ERR_ALERT_FATAL;
-}
-
-void QuicTransportListener::load_tls_cert() {
-    if (cert_file_.empty() || key_file_.empty()) {
-        spdlog::warn("QUIC: no cert/key configured, TLS won't work");
-        return;
-    }
-
-    ssl_ctx_ = SSL_CTX_new(TLS_method());
-    if (!ssl_ctx_) {
-        spdlog::error("QUIC: SSL_CTX_new failed");
-        return;
-    }
-
-    // Load certificate chain.
-    if (SSL_CTX_use_certificate_chain_file(ssl_ctx_,
-                                            cert_file_.c_str()) != 1) {
-        spdlog::error("QUIC: failed to load cert file: {}", cert_file_);
-        SSL_CTX_free(ssl_ctx_);
-        ssl_ctx_ = nullptr;
-        return;
-    }
-
-    // Load private key.
-    if (SSL_CTX_use_PrivateKey_file(ssl_ctx_, key_file_.c_str(),
-                                    SSL_FILETYPE_PEM) != 1) {
-        spdlog::error("QUIC: failed to load key file: {}", key_file_);
-        SSL_CTX_free(ssl_ctx_);
-        ssl_ctx_ = nullptr;
-        return;
-    }
-
-    // Restrict to TLS 1.3 (QUIC requires it).
-    SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
-
-    // ALPN callback for H3 negotiation.
-    SSL_CTX_set_alpn_select_cb(ssl_ctx_, select_alpn_cb, nullptr);
-    spdlog::debug("QUIC ALPN callback set (h3, h3-29)");
-
-    s_ssl_ctx_ = ssl_ctx_;
-    spdlog::info("QUIC TLS cert loaded: {}", cert_file_);
-}
+// ── TLS lookups (server role) ─────────────────────────────
+// The SSL_CTX is created ONCE by make_server_ssl_ctx and injected; these
+// callbacks only hand it to lsquic.  lookup_cert_cb reaches the listener via
+// `self` (ea_cert_lu_ctx); get_ssl_ctx_cb has no self pointer, so it reaches
+// the listener through the connection's peer_ctx — we pass `this` as the
+// conn_ctx to lsquic_engine_packet_in (see on_packet).
 
 struct ssl_ctx_st*
 QuicTransportListener::lookup_cert_cb(void* self,
@@ -890,39 +894,32 @@ QuicTransportListener::lookup_cert_cb(void* self,
                                        const char* sni) {
     auto* listener = static_cast<QuicTransportListener*>(self);
     spdlog::debug("QUIC lookup_cert_cb sni={} ssl_ctx={}",
-                  sni ? sni : "(null)", static_cast<void*>(listener->ssl_ctx_));
-    return listener->ssl_ctx_;
+                  sni ? sni : "(null)",
+                  static_cast<void*>(listener->ssl_ctx_.get()));
+    return listener->ssl_ctx_.get();
 }
 
 struct ssl_ctx_st*
 QuicTransportListener::get_ssl_ctx_cb(void* peer_ctx,
                                        const struct sockaddr* /*local*/) {
-    spdlog::debug("QUIC get_ssl_ctx_cb peer_ctx={} ssl_ctx={}",
-                  peer_ctx, static_cast<void*>(s_ssl_ctx_));
-    return s_ssl_ctx_;
+    auto* listener = static_cast<QuicTransportListener*>(peer_ctx);
+    spdlog::debug("QUIC get_ssl_ctx_cb ssl_ctx={}",
+                  static_cast<void*>(listener->ssl_ctx_.get()));
+    return listener->ssl_ctx_.get();
 }
 
 // ═══════════════════════════════════════════════════════════
 // QuicClientEngine
 // ═══════════════════════════════════════════════════════════
 
-QuicClientEngine::QuicClientEngine(asio::io_context& io)
+QuicClientEngine::QuicClientEngine(asio::io_context& io, SslCtxPtr ssl_ctx)
     : io_(io),
       socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0)),
       tick_timer_(io),
-      raw_fd_(socket_.native_handle()) {
+      raw_fd_(socket_.native_handle()),
+      ssl_ctx_(std::move(ssl_ctx)) {
 
     ensure_quic_global_init();
-
-    // Client TLS context: TLS 1.3, no server certificate needed, and — because
-    // ea_verify_cert stays NULL below — NO server-cert verification (the
-    // curl -k equivalent).  The upstream for this demo is a self-signed server.
-    ssl_ctx_ = SSL_CTX_new(TLS_method());
-    if (ssl_ctx_) {
-        SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
-        SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
-        s_client_ssl_ctx_ = ssl_ctx_;
-    }
 
     struct lsquic_engine_settings settings;
     lsquic_engine_init_settings(&settings, LSENG_HTTP);
@@ -949,12 +946,7 @@ QuicClientEngine::~QuicClientEngine() {
         lsquic_engine_destroy(engine_);
         engine_ = nullptr;
     }
-    if (ssl_ctx_) {
-        auto* ctx = ssl_ctx_;
-        ssl_ctx_ = nullptr;
-        s_client_ssl_ctx_ = nullptr;
-        SSL_CTX_free(ctx);
-    }
+    // ssl_ctx_ is a shared_ptr — released here (last holder frees the SSL_CTX).
 }
 
 void QuicClientEngine::set_new_session_cb(NewClientSessionCallback cb) {
@@ -997,7 +989,7 @@ bool QuicClientEngine::connect(const BackendEndpoint& ep) {
         engine_, N_LSQVER,                                // let the engine pick version
         reinterpret_cast<const struct sockaddr*>(&local_sa),
         reinterpret_cast<const struct sockaddr*>(&peer_sa),
-        nullptr,              // peer_ctx
+        this,                 // peer_ctx — get_ssl_ctx_cb reads it back
         nullptr,              // conn_ctx — on_new_conn's return value becomes it
         ep.host.c_str(),      // hostname → TLS SNI (required for HTTP)
         0,                    // base_plpmtu — auto
@@ -1128,8 +1120,10 @@ void QuicClientEngine::arm_send_retry() {
 }
 
 struct ssl_ctx_st*
-QuicClientEngine::get_ssl_ctx_cb(void*, const struct sockaddr*) {
-    return s_client_ssl_ctx_;
+QuicClientEngine::get_ssl_ctx_cb(void* peer_ctx, const struct sockaddr*) {
+    // peer_ctx is `this` — passed to lsquic_engine_connect (see connect()).
+    auto* engine = static_cast<QuicClientEngine*>(peer_ctx);
+    return engine->ssl_ctx_.get();
 }
 
 } // namespace ebpf_quic_proxy

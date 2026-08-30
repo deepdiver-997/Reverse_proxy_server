@@ -31,7 +31,9 @@ public:
         std::function<void(asio::error_code, ITransportStreamPtr,
                            const BackendEndpoint&, bool from_pool)>;
 
-    explicit UpstreamPool(asio::io_context& io);
+    /// `client_ssl_ctx` is the shared client TLS context (make_client_ssl_ctx),
+    /// externally held and injected into any QUIC client engine we create.
+    explicit UpstreamPool(asio::io_context& io, SslCtxPtr client_ssl_ctx);
 
     void add_backend(const BackendEndpoint& be);
 
@@ -78,6 +80,7 @@ private:
     };
 
     std::unique_ptr<QuicClientEngine> quic_engine_;
+    SslCtxPtr client_ssl_ctx_; // shared client TLS ctx, injected into the engine
     std::optional<PendingQuic> pending_quic_; // consumed by on_client_conn
     /// Established client connections per upstream (key "host:port").
     std::map<std::string, std::deque<QuicTransportSessionPtr>> quic_conns_;

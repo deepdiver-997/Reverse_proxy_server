@@ -4,7 +4,8 @@
 
 namespace ebpf_quic_proxy {
 
-UpstreamPool::UpstreamPool(asio::io_context& io) : io_(io) {}
+UpstreamPool::UpstreamPool(asio::io_context& io, SslCtxPtr client_ssl_ctx)
+    : io_(io), client_ssl_ctx_(std::move(client_ssl_ctx)) {}
 
 void UpstreamPool::add_backend(const BackendEndpoint& be) {
     {
@@ -17,7 +18,8 @@ void UpstreamPool::add_backend(const BackendEndpoint& be) {
     if (be.protocol == TransportProtocol::QUIC) {
         std::lock_guard lock(mutex_);
         if (!quic_engine_) {
-            quic_engine_ = std::make_unique<QuicClientEngine>(io_);
+            quic_engine_ =
+                std::make_unique<QuicClientEngine>(io_, client_ssl_ctx_);
             quic_engine_->set_new_session_cb(
                 [this](QuicTransportSessionPtr session) {
                     on_client_conn(std::move(session));

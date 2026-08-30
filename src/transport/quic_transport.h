@@ -15,7 +15,36 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+// The OpenSSL/BoringSSL SSL_CTX — forward-declared at GLOBAL scope so
+// `struct ssl_ctx_st` inside the namespace resolves to the same type that
+// lsquic.h and the TLS APIs use (a namespace-scoped declaration would be a
+// different, incompatible type).
+struct ssl_ctx_st;
+
 namespace ebpf_quic_proxy {
+
+// ── TLS contexts (thread-safe one-time setup, externally held + injected) ──
+
+/// Shared TLS context.  An SSL_CTX is immutable after setup and safe to share
+/// across threads for NEW connections (OpenSSL/BoringSSL standard model);
+/// ownership is shared so multiple engines (Model B: one per thread) can hold
+/// the same context.  Created ONCE at startup and injected — never a static.
+using SslCtxPtr = std::shared_ptr<struct ssl_ctx_st>;
+
+/// One-time lsquic global init — thread-safe (std::call_once blocks callers
+/// until the first init completes; a bare atomic "already started?" flag would
+/// let a second thread return before init finished).
+void ensure_quic_global_init();
+
+/// Build the server TLS context: TLS 1.3 + cert chain + key + H3 ALPN.
+/// Returns nullptr (logged) when the cert/key can't be loaded.  The makers run
+/// ensure_quic_global_init() internally, so order is safe.
+SslCtxPtr make_server_ssl_ctx(const std::string& cert_file,
+                              const std::string& key_file);
+
+/// Build the client TLS context (TLS 1.3, no cert verification —
+/// ea_verify_cert stays NULL, the curl -k equivalent).
+SslCtxPtr make_client_ssl_ctx();
 
 // ── QuicH3HeaderSet ───────────────────────────────────────
 
@@ -182,11 +211,11 @@ public:
     using NewSessionCallback =
         std::function<void(QuicTransportSessionPtr)>;
 
-    /// Create a QUIC listener bound to `port`.
-    /// Requires TLS cert/key for QUIC handshake.
+    /// Create a QUIC listener bound to `port`, using the injected server TLS
+    /// context (created once by make_server_ssl_ctx — externally held, so no
+    /// per-instance cert loading and no shared static).
     QuicTransportListener(asio::io_context& io, uint16_t port,
-                          const std::string& cert_file,
-                          const std::string& key_file);
+                          SslCtxPtr ssl_ctx);
     ~QuicTransportListener();
 
     /// Register callback for new QUIC sessions.
@@ -207,11 +236,10 @@ private:
     lsquic_engine_t* engine_ = nullptr;
     NewSessionCallback new_session_cb_;
 
-    // TLS — loaded once, shared by all QUIC connections.
-    struct ssl_ctx_st* ssl_ctx_ = nullptr; // SSL_CTX*
-    static inline struct ssl_ctx_st* s_ssl_ctx_ = nullptr;
-    std::string cert_file_, key_file_;
-    void load_tls_cert();
+    // TLS context — externally created (make_server_ssl_ctx) and injected;
+    // immutable after setup, shared read-only across threads.  Callbacks reach
+    // it via `self` (lookup_cert_cb) or the conn's peer_ctx (get_ssl_ctx_cb).
+    SslCtxPtr ssl_ctx_;
     static struct ssl_ctx_st* lookup_cert_cb(void* self,
                                               const struct sockaddr* local,
                                               const char* sni);
@@ -258,7 +286,9 @@ public:
     using NewClientSessionCallback =
         std::function<void(QuicTransportSessionPtr)>;
 
-    QuicClientEngine(asio::io_context& io);
+    /// `ssl_ctx` is the shared client TLS context (make_client_ssl_ctx),
+    /// externally held and injected — never a static.
+    QuicClientEngine(asio::io_context& io, SslCtxPtr ssl_ctx);
     ~QuicClientEngine();
 
     /// Register callback for new outbound QUIC sessions (the pool).
@@ -285,9 +315,9 @@ private:
     NewClientSessionCallback new_session_cb_;
     bool started_ = false;              // recv/tick loop armed on first connect
 
-    // Client TLS context (TLS1.3, no cert verification — see ea_verify_cert).
-    struct ssl_ctx_st* ssl_ctx_ = nullptr;
-    static inline struct ssl_ctx_st* s_client_ssl_ctx_ = nullptr;
+    // Client TLS context (TLS1.3, no cert verification) — externally created
+    // (make_client_ssl_ctx) and injected; shared read-only across threads.
+    SslCtxPtr ssl_ctx_;
 
     // Receiving.
     std::array<char, 65536> recv_buf_{};
