@@ -1,5 +1,7 @@
 #include "relay_session.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 namespace ebpf_quic_proxy {
@@ -31,6 +33,9 @@ void RelaySession::request_phase() {
             }
             client_keep_alive_ = keep_alive;
             request_method_ = head.method;
+            // WebSocket / Upgrade: forwarded normally; a 101 response later
+            // switches this relay into raw byte-bridge mode.
+            request_is_upgrade_ = is_upgrade_request(head);
 
             spdlog::info("{} {} {} from {}", head.method, head.path,
                          head.headers.get("host").value_or("-"),
@@ -40,6 +45,14 @@ void RelaySession::request_phase() {
             // (forward-proxy style), bypassing the route table entirely.
             if (head.method == "CONNECT") {
                 handle_connect(std::move(head));
+                return;
+            }
+
+            // Absolute-form target ("GET http://host/path") → the client is
+            // using this proxy as a FORWARD proxy: connect straight to the
+            // URL's authority, skip the route table.
+            if (head.absolute_target) {
+                handle_forward(std::move(head), std::move(body));
                 return;
             }
 
@@ -58,20 +71,94 @@ void RelaySession::request_phase() {
                                          ITransportStreamPtr upstream,
                                          const BackendEndpoint& endpoint,
                                          bool from_pool) mutable {
-                    if (ec) {
-                        spdlog::warn("upstream connect failed: {}", ec.message());
-                        write_error(HttpStatus::BadGateway, "upstream unreachable\n");
-                        return;
-                    }
-                    backend_ = std::move(upstream);
-                    backend_endpoint_ = endpoint;
-                    backend_from_pool_ = from_pool;
-                    pending_head_ =
-                        std::make_shared<HttpRequestHead>(std::move(head));
-                    pending_body_ = std::move(body);
-                    send_backend_request(/*retry_allowed=*/true);
+                    use_backend(ec, std::move(upstream), endpoint, from_pool,
+                                std::move(head), std::move(body));
                 });
         });
+}
+
+// ── Forward proxy: absolute-form target ───────────────────
+
+void RelaySession::handle_forward(HttpRequestHead head, BodySourcePtr body) {
+    // The request-target was absolute-form; `head` already carries the URL's
+    // scheme/authority and an origin-form path (H1Codec normalized it).  Plain
+    // HTTP forward proxy — https absolute-form is invalid (clients must use
+    // CONNECT to tunnel TLS), so reject it.
+    if (head.scheme != "http") {
+        spdlog::warn("forward: unsupported scheme '{}' (https needs CONNECT)",
+                     head.scheme);
+        write_error(HttpStatus::BadRequest,
+                    "https absolute-form requires CONNECT\n");
+        return;
+    }
+
+    // Split authority "host[:port]" — default port 80 for http.
+    std::string host = head.authority;
+    uint16_t port = 80;
+    auto colon = head.authority.rfind(':');
+    if (colon != std::string::npos) {
+        char* end = nullptr;
+        unsigned long p =
+            std::strtoul(head.authority.c_str() + colon + 1, &end, 10);
+        if (colon == 0 || p == 0 || p > 65535) {
+            write_error(HttpStatus::BadRequest, "bad target\n");
+            return;
+        }
+        host = head.authority.substr(0, colon);
+        port = static_cast<uint16_t>(p);
+    }
+
+    // The origin must be identified by the URL authority (RFC 9110 §3.2.2).
+    head.headers.set("host", head.authority);
+
+    spdlog::info("forward {} http://{}{} from {}", head.method,
+                 head.authority, head.path, client_->stream_id());
+
+    BackendEndpoint target{"", host, port, 1};
+    auto self = shared_from_this();
+    pool_->async_connect_fresh(
+        target,
+        [this, self, head = std::move(head), body = std::move(body)](
+            asio::error_code ec, ITransportStreamPtr upstream,
+            const BackendEndpoint& endpoint, bool from_pool) mutable {
+            use_backend(ec, std::move(upstream), endpoint, from_pool,
+                        std::move(head), std::move(body));
+        });
+}
+
+// ── Shared connect handling (reverse proxy + forward proxy) ──
+
+void RelaySession::use_backend(asio::error_code ec,
+                               ITransportStreamPtr upstream,
+                               const BackendEndpoint& endpoint, bool from_pool,
+                               HttpRequestHead head, BodySourcePtr body) {
+    if (ec) {
+        spdlog::warn("upstream connect failed: {}", ec.message());
+        write_error(HttpStatus::BadGateway, "upstream unreachable\n");
+        return;
+    }
+    backend_ = std::move(upstream);
+    backend_endpoint_ = endpoint;
+    backend_from_pool_ = from_pool;
+    pending_head_ = std::make_shared<HttpRequestHead>(std::move(head));
+    pending_body_ = std::move(body);
+    send_backend_request(/*retry_allowed=*/true);
+}
+
+bool RelaySession::is_upgrade_request(const HttpRequestHead& head) const {
+    // WebSocket and other protocol upgrades announce themselves with an
+    // "Upgrade" header plus a "Connection: upgrade" token (RFC 9110 §7.8).
+    if (!head.headers.get("upgrade"))
+        return false;
+    if (auto c = head.headers.get("connection")) {
+        std::string lower = *c;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char ch) {
+                           return static_cast<char>(std::tolower(ch));
+                       });
+        return lower.find("upgrade") != std::string::npos;
+    }
+    return false;
 }
 
 // ── CONNECT tunnel (Bridge mode) ──────────────────────────
@@ -222,6 +309,27 @@ void RelaySession::response_phase() {
             // length — no body follows, suppress it to avoid hanging.
             if (request_method_ == "HEAD")
                 resp_body = nullptr;
+
+            // 101 Switching Protocols: the backend accepted an Upgrade (e.g.
+            // WebSocket).  Hand off the 101 (which has no body), then switch
+            // this relay to a raw byte bridge.  The backend connection is NOT
+            // returned to the pool — it's now a live tunnel.
+            if (request_is_upgrade_ && resp.status_code == 101) {
+                spdlog::info("relay: {} -> 101 upgrade, bridging",
+                             client_->stream_id());
+                client_codec_->async_write_response(
+                    client_, std::move(resp), nullptr,
+                    [this, self](asio::error_code ec) {
+                        if (ec) {
+                            teardown();
+                            return;
+                        }
+                        backend_from_pool_ = false; // never pool an upgraded conn
+                        bridge_mode();
+                    });
+                return;
+            }
+
             client_codec_->async_write_response(
                 client_, std::move(resp), std::move(resp_body),
                 [this, self, backend_keep_alive](asio::error_code) {

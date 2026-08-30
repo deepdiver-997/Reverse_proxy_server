@@ -19,6 +19,13 @@ namespace ebpf_quic_proxy {
 ///   after response: keep-alive backend → return to pool (Step 2), else close;
 ///                   keep-alive client → loop to Request, else teardown
 ///
+/// Three special flows branch off the request phase:
+///   - CONNECT host:port          → direct tunnel (byte bridge), no route table
+///   - absolute-form target       → forward proxy: direct-connect to the URL's
+///                                  authority (ADR-7 "backend-select" split)
+///   - WebSocket Upgrade request  → forwarded; a 101 response switches to the
+///                                  same byte bridge (skip pool return)
+///
 /// Backend connections are pooled (Step 2): idle connections are returned via
 /// UpstreamPool::release and reused on the next request.  A pooled connection
 /// may be stale (backend closed it while idle) — on a request write failure we
@@ -35,6 +42,11 @@ public:
 private:
     void request_phase();
     void handle_connect(HttpRequestHead head); // CONNECT → tunnel
+    void handle_forward(HttpRequestHead head, BodySourcePtr body);
+    void use_backend(asio::error_code ec, ITransportStreamPtr upstream,
+                     const BackendEndpoint& endpoint, bool from_pool,
+                     HttpRequestHead head, BodySourcePtr body);
+    bool is_upgrade_request(const HttpRequestHead& head) const;
     void start_tunnel();
     void bridge_mode();
     void pump_bytes(ITransportStreamPtr src, ITransportStreamPtr dst);
@@ -60,6 +72,7 @@ private:
     BodySourcePtr pending_body_;
     std::string request_method_;
     bool client_keep_alive_ = false;
+    bool request_is_upgrade_ = false; // client asked for an Upgrade (WebSocket)
     bool done_ = false;
 };
 
