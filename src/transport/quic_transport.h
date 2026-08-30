@@ -23,9 +23,11 @@ namespace ebpf_quic_proxy {
 /// `hsi_process_header`.  Handed back to us by `lsquic_stream_get_hset()`.
 struct QuicH3HeaderSet {
     std::array<char, 64 * 1024> decode_buf{};   // lsxpack decoder buffer
-    std::vector<std::pair<std::string, std::string>> headers; // name, value
-    std::string method, path, authority, scheme;
-    int status_code = 0;
+    // ALL decoded fields — pseudo-headers (":method", ":path", ":scheme",
+    // ":authority", ":status") included — in wire order.  The transport only
+    // decodes; the codec interprets them into a request or response IR
+    // (H3Codec::async_parse_request / async_parse_response).
+    std::vector<std::pair<std::string, std::string>> headers;
     struct lsxpack_header xhdr {};
     std::size_t decode_off = 0;
     bool have_xhdr = false;

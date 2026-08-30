@@ -23,13 +23,15 @@ public:
     using ShutdownCallback =
         std::function<void(asio::error_code)>;
 
-    /// Result of taking internally-decoded request headers (HTTP/3).
-    using HeadersCallback =
-        std::function<void(asio::error_code, HttpRequestHead)>;
-
-    /// Ordered list of (name, value) header pairs for HTTP/3 send_headers
-    /// (pseudo-headers first, e.g. ":status").
+    /// Ordered list of (name, value) header pairs for HTTP/3 — QPACK-decoded
+    /// pseudo-headers (e.g. ":status") plus regular fields, in wire order.
     using HeaderList = std::vector<std::pair<std::string, std::string>>;
+
+    /// Result of taking internally-decoded HTTP/3 headers (pseudo-headers
+    /// included).  The transport only decodes; interpreting them into a
+    /// request or response IR is the codec's job (see H3Codec).
+    using HeadersCallback =
+        std::function<void(asio::error_code, HeaderList)>;
 
     virtual ~ITransportStream() = default;
 
@@ -47,9 +49,9 @@ public:
     /// Opaque id for logging / tracing.
     virtual std::string stream_id() const = 0;
 
-    /// Optional (HTTP/3): transports that decode request headers internally
-    /// (lsquic QPACK) expose them here. `cb` fires with the request IR when
-    /// the decoded header set is ready, or with an error. Must be called
+    /// Optional (HTTP/3): transports that decode headers internally (lsquic
+    /// QPACK) expose them here. `cb` fires with the raw decoded header list
+    /// (pseudo-headers included) when ready, or with an error. Must be called
     /// before any body read. Base implementation reports "not supported".
     /// Returns false when the transport does not provide decoded headers
     /// (e.g. raw TCP) or a take is already pending.

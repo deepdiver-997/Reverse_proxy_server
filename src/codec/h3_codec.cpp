@@ -1,6 +1,9 @@
 #include "h3_codec.h"
 #include "http_message.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 
 namespace ebpf_quic_proxy {
 
@@ -132,7 +135,79 @@ bool parse_request_headers(
     return true;
 }
 
+// ── Decoded-header-list → IR (transport only decodes; we interpret) ──
+
+HttpRequestHead request_head_from_headers(
+    const ITransportStream::HeaderList& raw) {
+    HttpRequestHead head;
+    for (const auto& [n, v] : raw) {
+        if (n == ":method") {
+            head.method = v;
+        } else if (n == ":path") {
+            head.path = v;
+        } else if (n == ":scheme") {
+            head.scheme = v;
+        } else if (n == ":authority") {
+            // Map :authority → host so Host-based routing works uniformly with
+            // H1; keep the field for forward-proxy direct connects.
+            head.authority = v;
+            head.headers.set("host", v);
+        } else if (n.empty() || n[0] == ':') {
+            continue; // unknown pseudo-header — skip
+        } else {
+            head.headers.add(n, v);
+        }
+    }
+    if (auto cl = head.headers.get("content-length")) {
+        char* end = nullptr;
+        head.content_length = std::strtoul(cl->c_str(), &end, 10);
+    }
+    return head;
+}
+
+HttpResponseHead response_head_from_headers(
+    const ITransportStream::HeaderList& raw) {
+    HttpResponseHead head;
+    head.reason = ""; // HTTP/3 has no reason phrase (RFC 9114 §4.1)
+    for (const auto& [n, v] : raw) {
+        if (n == ":status") {
+            char* end = nullptr;
+            long sc = std::strtol(v.c_str(), &end, 10);
+            head.status_code = static_cast<int>(sc);
+        } else if (n.empty() || n[0] == ':') {
+            continue; // other pseudo-headers don't belong in a response
+        } else {
+            head.headers.add(n, v);
+        }
+    }
+    if (auto cl = head.headers.get("content-length")) {
+        char* end = nullptr;
+        head.content_length = std::strtoul(cl->c_str(), &end, 10);
+    }
+    return head;
+}
+
 } // namespace h3_detail
+
+namespace {
+
+// RFC 9113 §8.1.2.2: hop-by-hop headers describe a single HTTP/1.1 connection
+// (framing, upgrade, proxies) and must NOT be carried over HTTP/2 or HTTP/3.
+// The body framing is DATA frames, not chunked; Connection/Upgrade are end-to-
+// end concepts only in the upgrade handshake, which H3 replaces (Extended
+// CONNECT).  Strip them when re-serializing for an H3 peer.
+bool is_hop_by_hop(const std::string& name) {
+    std::string l(name);
+    std::transform(l.begin(), l.end(), l.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    return l == "connection" || l == "keep-alive" ||
+           l == "proxy-connection" || l == "transfer-encoding" ||
+           l == "upgrade";
+}
+
+} // namespace
 
 // ═══════════════════════════════════════════════════════════
 // H3Codec — async_parse_request
@@ -140,16 +215,17 @@ bool parse_request_headers(
 
 void H3Codec::async_parse_request(ITransportStreamPtr stream,
                                    ParseCallback cb) {
-    // ADR-8 (route B): request headers come pre-decoded from the transport
-    // (lsquic QPACK, see QuicTransportStream::try_take_headers); the body is
-    // the stream's DATA payloads read until FIN.
+    // ADR-8 (route B): headers come pre-decoded from the transport (lsquic
+    // QPACK) as a raw list; interpret them into the request IR here.  The body
+    // is the stream's DATA payloads read until FIN.
     bool ok = stream->async_take_headers(
-        [stream, cb = std::move(cb)](asio::error_code ec,
-                                     HttpRequestHead head) mutable {
+        [stream, cb = std::move(cb)](
+            asio::error_code ec, ITransportStream::HeaderList raw) mutable {
             if (ec) {
                 cb(ec, {}, nullptr, false);
                 return;
             }
+            auto head = h3_detail::request_head_from_headers(raw);
             auto body = std::make_shared<StreamEofBodySource>(stream);
             // HTTP/3 streams are one-shot — the connection persists at the
             // session level, not via keep-alive on this stream.
@@ -161,18 +237,53 @@ void H3Codec::async_parse_request(ITransportStreamPtr stream,
 }
 
 // ═══════════════════════════════════════════════════════════
-// H3Codec — async_write_response
+// H3Codec — async_parse_response
 // ═══════════════════════════════════════════════════════════
 
-void H3Codec::async_write_response(ITransportStreamPtr stream,
-                                    HttpResponseHead head, BodySourcePtr body,
-                                    WriteCallback cb) {
-    // Send the header block via lsquic_stream_send_headers, then pump the body
-    // as DATA payloads.
+void H3Codec::async_parse_response(ITransportStreamPtr stream,
+                                   ResponseCallback cb) {
+    // Same decoded-header machinery as the request path; the response IR picks
+    // up `:status`.  Only reachable once an HTTP/3 upstream transport exists.
+    bool ok = stream->async_take_headers(
+        [stream, cb = std::move(cb)](
+            asio::error_code ec, ITransportStream::HeaderList raw) mutable {
+            if (ec) {
+                cb(ec, {}, nullptr, false);
+                return;
+            }
+            auto resp = h3_detail::response_head_from_headers(raw);
+            auto body = std::make_shared<StreamEofBodySource>(stream);
+            cb({}, std::move(resp), std::move(body), /*keep_alive=*/false);
+        });
+    if (!ok)
+        cb(asio::error::operation_not_supported, {}, nullptr, false);
+}
+
+// ═══════════════════════════════════════════════════════════
+// H3Codec — async_write_request
+// ═══════════════════════════════════════════════════════════
+
+void H3Codec::async_write_request(ITransportStreamPtr stream,
+                                  HttpRequestHead head, BodySourcePtr body,
+                                  WriteCallback cb) {
+    // Serialize the IR as HTTP/3 pseudo-headers + regular fields, then pump
+    // the body as DATA payloads.  Only reachable once an HTTP/3 upstream
+    // transport exists.
     ITransportStream::HeaderList headers;
-    headers.emplace_back(":status", std::to_string(head.status_code));
-    for (const auto& [k, v] : head.headers.entries())
+    headers.emplace_back(":method",
+                         head.method.empty() ? "GET" : head.method);
+    headers.emplace_back(":scheme",
+                         head.scheme.empty() ? "http" : head.scheme);
+    std::string authority = head.authority;
+    if (authority.empty())
+        authority = head.headers.get("host").value_or("");
+    headers.emplace_back(":authority", std::move(authority));
+    headers.emplace_back(":path", head.path.empty() ? "/" : head.path);
+    for (const auto& [k, v] : head.headers.entries()) {
+        if (is_hop_by_hop(k))
+            continue; // RFC 9113 §8.1.2.2 — framing/upgrade headers don't cross
         headers.emplace_back(k, v);
+    }
 
     bool ok = stream->async_send_headers(
         headers,
@@ -190,22 +301,37 @@ void H3Codec::async_write_response(ITransportStreamPtr stream,
 }
 
 // ═══════════════════════════════════════════════════════════
-// H3Codec — async_parse_response / async_write_request
+// H3Codec — async_write_response
 // ═══════════════════════════════════════════════════════════
-// Only needed when the UPSTREAM speaks HTTP/3.  Not wired yet (the upstream
-// side is HTTP/1.1), so these are explicit "not supported" stubs.
 
-void H3Codec::async_parse_response(ITransportStreamPtr stream,
-                                   ResponseCallback cb) {
-    spdlog::warn("H3: async_parse_response not implemented (H3 upstream not wired)");
-    cb(asio::error::operation_not_supported, {}, nullptr, false);
-}
+void H3Codec::async_write_response(ITransportStreamPtr stream,
+                                   HttpResponseHead head, BodySourcePtr body,
+                                   WriteCallback cb) {
+    // Send the header block via lsquic_stream_send_headers, then pump the body
+    // as DATA payloads.  Hop-by-hop headers from the H1 upstream (e.g.
+    // "transfer-encoding: chunked", "connection") are stripped — they describe
+    // the upstream connection, not this H3 response (RFC 9113 §8.1.2.2).
+    ITransportStream::HeaderList headers;
+    headers.emplace_back(":status", std::to_string(head.status_code));
+    for (const auto& [k, v] : head.headers.entries()) {
+        if (is_hop_by_hop(k))
+            continue;
+        headers.emplace_back(k, v);
+    }
 
-void H3Codec::async_write_request(ITransportStreamPtr stream,
-                                  HttpRequestHead head, BodySourcePtr body,
-                                  WriteCallback cb) {
-    spdlog::warn("H3: async_write_request not implemented (H3 upstream not wired)");
-    cb(asio::error::operation_not_supported);
+    bool ok = stream->async_send_headers(
+        headers,
+        [stream, body = std::move(body), cb = std::move(cb)](
+            asio::error_code ec, std::size_t) mutable {
+            if (ec || !body) {
+                cb(ec);
+                return;
+            }
+            pump_body_to_stream(std::move(stream), std::move(body),
+                                std::move(cb));
+        });
+    if (!ok)
+        cb(asio::error::operation_not_supported);
 }
 
 } // namespace ebpf_quic_proxy

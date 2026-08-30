@@ -134,3 +134,68 @@ TEST_CASE("parse_request_headers ignores unknown pseudo", "[h3_codec]") {
     REQUIRE(hdrs.get(":scheme").has_value() == false);
     REQUIRE(hdrs.get("x-custom").value_or("") == "hello");
 }
+
+// ═══════════════════════════════════════════════════════════
+// decoded-header-list → IR interpretation
+// ═══════════════════════════════════════════════════════════
+
+TEST_CASE("request_head_from_headers routes pseudo-headers", "[h3_codec]") {
+    ITransportStream::HeaderList raw = {
+        {":method", "POST"},
+        {":scheme", "https"},
+        {":authority", "api.example.com"},
+        {":path", "/submit?q=1"},
+        {"content-type", "application/json"},
+        {"x-custom", "hello"},
+        {":unknown", "ignored"}, // unknown pseudo → dropped
+    };
+
+    auto head = h3_detail::request_head_from_headers(raw);
+    REQUIRE(head.method == "POST");
+    REQUIRE(head.scheme == "https");
+    REQUIRE(head.authority == "api.example.com");
+    REQUIRE(head.path == "/submit?q=1");
+    // :authority is also surfaced as host for uniform routing.
+    REQUIRE(head.headers.get("host").value() == "api.example.com");
+    REQUIRE(head.headers.get("content-type").value() == "application/json");
+    REQUIRE(head.headers.get("x-custom").value() == "hello");
+    REQUIRE_FALSE(head.headers.get(":unknown").has_value());
+    REQUIRE_FALSE(head.absolute_target); // H3 has no absolute-form target
+}
+
+TEST_CASE("request_head_from_headers extracts content-length", "[h3_codec]") {
+    ITransportStream::HeaderList raw = {
+        {":method", "GET"},
+        {":path", "/"},
+        {"content-length", "42"},
+    };
+
+    auto head = h3_detail::request_head_from_headers(raw);
+    REQUIRE(head.content_length.value() == 42u);
+}
+
+TEST_CASE("response_head_from_headers maps :status", "[h3_codec]") {
+    ITransportStream::HeaderList raw = {
+        {":status", "200"},
+        {"content-type", "text/plain"},
+        {"content-length", "5"},
+    };
+
+    auto resp = h3_detail::response_head_from_headers(raw);
+    REQUIRE(resp.status_code == 200);
+    REQUIRE(resp.reason.empty()); // HTTP/3 has no reason phrase
+    REQUIRE(resp.headers.get("content-type").value() == "text/plain");
+    REQUIRE(resp.content_length.value() == 5u);
+}
+
+TEST_CASE("response_head_from_headers drops unknown pseudo", "[h3_codec]") {
+    ITransportStream::HeaderList raw = {
+        {":unknown", "x"},
+        {"x-a", "1"},
+    };
+
+    auto resp = h3_detail::response_head_from_headers(raw);
+    REQUIRE(resp.status_code == 0);
+    REQUIRE(resp.headers.get("x-a").value() == "1");
+    REQUIRE_FALSE(resp.headers.get(":unknown").has_value());
+}

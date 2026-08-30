@@ -123,24 +123,14 @@ void QuicTransportStream::try_take_headers() {
         return; // not decoded yet — on_read will fire again
     auto* hs = static_cast<QuicH3HeaderSet*>(hset);
 
-    // Convert the decoded H3 header set to the protocol-independent IR.
-    HttpRequestHead head;
-    head.method = std::move(hs->method);
-    head.path   = std::move(hs->path);
-    // Map :authority → host so Host-based routing works uniformly with H1.
-    if (!hs->authority.empty())
-        head.headers.set("host", std::move(hs->authority));
-    for (auto& [k, v] : hs->headers)
-        head.headers.add(std::move(k), std::move(v));
-    if (auto cl = head.headers.get("content-length")) {
-        char* end = nullptr;
-        head.content_length = std::strtoul(cl->c_str(), &end, 10);
-    }
+    // Hand the raw decoded header list to the codec (H3Codec interprets it
+    // into request or response IR).  The header set is ours to free.
+    HeaderList raw = std::move(hs->headers);
     delete hs;
 
     auto cb = std::move(headers_cb_);
     headers_cb_ = nullptr;
-    cb({}, std::move(head));
+    cb({}, std::move(raw));
 }
 
 bool QuicTransportStream::async_send_headers(const HeaderList& headers,
@@ -330,15 +320,11 @@ int QuicTransportListener::hsi_process(void* hset, struct lsxpack_header* hdr) {
     const char* value = lsxpack_header_get_value(hdr);
     if (!name || !value)
         return -1;
-    std::string n(name, hdr->name_len);
-    std::string v(value, hdr->val_len);
-    if (n == ":method")      hs->method = std::move(v);
-    else if (n == ":path")   hs->path = std::move(v);
-    else if (n == ":authority") hs->authority = std::move(v);
-    else if (n == ":scheme") hs->scheme = std::move(v);
-    else if (n == ":status") hs->status_code =
-                                 static_cast<int>(std::strtoul(v.c_str(), nullptr, 10));
-    else                     hs->headers.emplace_back(std::move(n), std::move(v));
+    // Keep every field, pseudo-headers included, in wire order.  Pseudo-header
+    // interpretation (which are request vs response, what they mean) is the
+    // codec's job, not the transport's.
+    hs->headers.emplace_back(std::string(name, hdr->name_len),
+                             std::string(value, hdr->val_len));
     return 0;
 }
 

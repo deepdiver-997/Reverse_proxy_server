@@ -75,6 +75,16 @@ namespace h3_detail {
         const uint8_t* data, std::size_t len,
         std::string& method, std::string& path, HeaderMap& hdrs,
         std::optional<std::size_t>& content_length);
+
+    /// Interpret a QPACK-decoded header list (pseudo-headers included) into a
+    /// request IR.  The transport only decodes; this does the interpretation.
+    HttpRequestHead request_head_from_headers(
+        const ITransportStream::HeaderList& raw);
+
+    /// Interpret a QPACK-decoded header list (pseudo-headers included) into a
+    /// response IR (`:status` → status_code; HTTP/3 has no reason phrase).
+    HttpResponseHead response_head_from_headers(
+        const ITransportStream::HeaderList& raw);
 }
 
 } // namespace ebpf_quic_proxy
