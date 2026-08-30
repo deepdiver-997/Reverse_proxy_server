@@ -5,6 +5,8 @@ extern "C" {
 #include <openssl/ssl.h>
 }
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -157,17 +159,21 @@ bool QuicTransportStream::async_send_headers(const HeaderList& headers,
     }
 
     // Build name/value bytes + lsxpack_header array pointing into them.
+    // HTTP/3 (RFC 9114 §4.2) mandates lowercase header field names.
     std::vector<char> name_vals;
     name_vals.reserve(total);
     std::vector<lsxpack_header> arr(headers.empty() ? 1 : headers.size());
     std::size_t off = 0;
     for (std::size_t i = 0; i < headers.size(); ++i) {
         const auto& [k, v] = headers[i];
-        name_vals.insert(name_vals.end(), k.begin(), k.end());
+        std::string lname(k);
+        std::transform(lname.begin(), lname.end(), lname.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        name_vals.insert(name_vals.end(), lname.begin(), lname.end());
         name_vals.insert(name_vals.end(), v.begin(), v.end());
-        lsxpack_header_set_offset2(&arr[i], name_vals.data(), off, k.size(),
-                                   off + k.size(), v.size());
-        off += k.size() + v.size();
+        lsxpack_header_set_offset2(&arr[i], name_vals.data(), off, lname.size(),
+                                   off + lname.size(), v.size());
+        off += lname.size() + v.size();
     }
 
     lsquic_http_headers_t hs = {
