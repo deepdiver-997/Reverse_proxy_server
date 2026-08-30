@@ -287,16 +287,26 @@ void H3Codec::async_write_request(ITransportStreamPtr stream,
         headers.emplace_back(k, v);
     }
 
+    // HTTP/3 streams carry exactly one message and are FIN-delimited.  FIN the
+    // write side once the request (headers + body) is out — otherwise the
+    // peer's FIN-delimited body reader never sees EOF for a bodyless request,
+    // and the request itself may not be flushed.
+    auto finish = [stream, cb = std::move(cb)](asio::error_code ec) mutable {
+        stream->async_shutdown([cb = std::move(cb)](asio::error_code sec) mutable {
+            cb(sec);
+        });
+    };
+
     bool ok = stream->async_send_headers(
         headers,
-        [stream, body = std::move(body), cb = std::move(cb)](
+        [stream, body = std::move(body), finish = std::move(finish)](
             asio::error_code ec, std::size_t) mutable {
             if (ec || !body) {
-                cb(ec);
+                finish(ec);
                 return;
             }
             pump_body_to_stream(std::move(stream), std::move(body),
-                                std::move(cb));
+                                std::move(finish));
         });
     if (!ok)
         cb(asio::error::operation_not_supported);
@@ -321,16 +331,24 @@ void H3Codec::async_write_response(ITransportStreamPtr stream,
         headers.emplace_back(k, v);
     }
 
+    // Same as the request path: FIN the response stream once the message is
+    // out, so the peer's FIN-delimited body reader completes.
+    auto finish = [stream, cb = std::move(cb)](asio::error_code ec) mutable {
+        stream->async_shutdown([cb = std::move(cb)](asio::error_code sec) mutable {
+            cb(sec);
+        });
+    };
+
     bool ok = stream->async_send_headers(
         headers,
-        [stream, body = std::move(body), cb = std::move(cb)](
+        [stream, body = std::move(body), finish = std::move(finish)](
             asio::error_code ec, std::size_t) mutable {
             if (ec || !body) {
-                cb(ec);
+                finish(ec);
                 return;
             }
             pump_body_to_stream(std::move(stream), std::move(body),
-                                std::move(cb));
+                                std::move(finish));
         });
     if (!ok)
         cb(asio::error::operation_not_supported);
