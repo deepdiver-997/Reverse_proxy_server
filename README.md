@@ -72,7 +72,7 @@ cmake --build build -j
 [listen]
 address    = "0.0.0.0"
 port       = 8080
-num_threads = 1          # ⚠️ QUIC 引擎非线程安全：保持 1 或按连接分片多引擎
+num_threads = 1          # 代理单元数：>1 时 SO_REUSEPORT 分片，每单元独立引擎（见下方说明）
 
 # QUIC (HTTP/3)：quic_port = 0 表示关闭
 quic_port       = 443
@@ -104,7 +104,7 @@ backend = "api"
 |---|---|---|
 | `listen.address` | `0.0.0.0` | 监听地址 |
 | `listen.port` | `8080` | TCP/HTTP/1.1 端口 |
-| `listen.num_threads` | `1` | io_context 工作线程数。**QUIC 引擎不允许并发驱动**，>1 时需先按连接分片到多个引擎（见 transport 文档） |
+| `listen.num_threads` | `1` | **代理单元数**（Model B）：每单元 = 1 线程 + 自己的 io_context / 监听 socket / 上游池（含自己的 QUIC 引擎），零共享。>1 时监听 socket 设 `SO_REUSEPORT`，Linux 上内核按 4 元组分发连接（每连接固定一个单元）；**macOS 允许多绑定但内核不分发**（流量全投给一个 socket），n>1 结构正确但退化为单单元活跃 |
 | `listen.quic_port` | `0` | QUIC UDP 端口，`0` 关闭 QUIC |
 | `backends[].id/host/port/weight` | — | 后端端点 |
 | `backends[].protocol` | `"h1"` | 后端协议：`"h1"` = TCP/HTTP/1.1，`"h3"` = QUIC/HTTP/3 上游 |

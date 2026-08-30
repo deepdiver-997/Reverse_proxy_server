@@ -17,11 +17,11 @@
 **后果**：全部回调单线程重入、无锁；但要求回调不做阻塞操作，且引擎必须单线程驱动。
 **依据**：详见 [transport.md](transport.md) §2、§5。
 
-### ADR-3：单引擎单线程，扩展走"多引擎分片"
+### ADR-3：多引擎分片（Model B）✅ 已实现
 
 **背景**：lsquic 引擎非线程安全，`num_threads > 1` 时收包/定时器两个入口会并发摸引擎。
-**决策**：保持 `num_threads = 1`（默认值）；未来要多核，按连接（CID）哈希分片到 N 个引擎、每引擎一线程，而不是给单引擎加锁。
-**后果**：现在零锁零并发问题；加锁方案被否决（收益为零 + 回调链死锁风险）。
+**决策**：`num_threads = N` = **N 个完全独立的代理单元**——每单元 = 自己的 io_context + 线程 + TCP acceptor + QUIC listener + 自己的 UpstreamPool（含自己的 QUIC client 引擎）+ codec + router，**零共享**（TLS 上下文每单元自建，无跨线程访问）。>1 时监听 socket 设 `SO_REUSEPORT`，靠内核按 4 元组分发连接。加锁方案被否决（收益为零 + 回调链死锁风险）。
+**⚠️ 平台差异**：Linux 的 `SO_REUSEPORT` 按 4 元组哈希负载均衡（每连接固定落一个单元）；**macOS 允许多绑定但内核不分发**——实测 UDP 与 TCP 流量全部投给同一个 socket，n>1 结构正确（多单元绑定、请求全部成功）但退化为单单元活跃。跨平台并行需用户态按 CID 解复用（未实现）。
 
 ### ADR-4：`QuicTransportSession*` 直接作为 `lsquic_conn_ctx_t`
 
