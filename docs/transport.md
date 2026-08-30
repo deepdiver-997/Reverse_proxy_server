@@ -71,7 +71,7 @@ lsquic 引擎**没有**自己的线程、socket、定时器。它只是一台状
 
 ## 6. 健壮性要点（含近期修复）
 
-- `on_conn_closed_cb` 是连接的最后一次回调：先 `shared_from_this()` 拿保活拷贝 → `on_closed()` → `release_self()` 释放自持，析构发生在回调返回后（避免在成员函数内销毁 `this`，也避免 lsquic 之后还引用悬垂 ctx）。
+- `on_conn_closed_cb` 是连接的最后一次回调：先 `shared_from_this()` 拿保活拷贝 → `on_closed()`（**`lsquic_conn_set_ctx(conn, NULL)` 清掉 conn_ctx**——lsquic 销毁连接时断言它为 NULL，见 §8）→ `release_self()` 释放自持，析构发生在回调返回后（避免在成员函数内销毁 `this`，也避免 lsquic 之后还引用悬垂 ctx）。
 - `QuicTransportStream` 与 session **同样自持**（`adopt_self()`/`release_self()`）：`on_close` 先置 `stream_=nullptr` 再发 EOF 回调（防回调重入摸 lsquic），最后 `release_self()`；`on_close_cb` 先拿 `shared_from_this()` 保活。`async_read_some` 对已关闭流直接回 EOF。
 - UDP 收包错误后要重新 `do_recv()`（瞬时错误不能杀死整个监听循环）；`operation_aborted` 表示关闭，不再 re-arm。
 - `on_packets_out` 遇 `EAGAIN/EWOULDBLOCK`：保留未发包，等 socket 可写（`socket_.async_wait(wait_write)`）再调 `lsquic_engine_send_unsent_packets()`，否则那些包永久滞留、连接最终超时。
@@ -155,7 +155,9 @@ lsquic 决定关闭连接
   │
   ▼ ① 调用 on_conn_closed_cb —— 此刻 lsquic 的 conn 对象仍【完全有效】
      ② 回调里：先 shared_from_this() 拿保活拷贝
-     ③ on_closed()：置 conn_ = nullptr（从此不再摸 lsquic）、改 closed_ 标志
+     ③ on_closed()：lsquic_conn_set_ctx(conn, NULL) 清掉 conn_ctx（lsquic 销毁连接时
+        assert(cn_conn_ctx == NULL)，不清就 abort —— ADR-9 坑 1），
+        再置 conn_ = nullptr（从此不再摸 lsquic）、改 closed_ 标志
      ④ release_self()：释放自持
      ⑤ 回调返回，保活拷贝析构 → wrapper 析构
   ▼ ⑥ lsquic 这才真正 free 它的 conn 对象
