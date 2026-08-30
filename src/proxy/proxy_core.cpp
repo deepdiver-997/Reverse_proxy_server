@@ -86,7 +86,8 @@ void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     // parse request → route → connect backend → relay → loop (H1 keep-alive)
     // or teardown.  It injects router + upstream pool + codecs.
     auto session = std::make_shared<RelaySession>(
-        std::move(stream), codec, h1_codec_.get(), &router_, &upstream_pool_);
+        std::move(stream), codec, h1_codec_.get(), h3_codec_.get(), &router_,
+        &upstream_pool_);
     session->start();
 }
 

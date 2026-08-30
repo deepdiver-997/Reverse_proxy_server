@@ -33,8 +33,12 @@ namespace ebpf_quic_proxy {
 /// partially-consumed body can't be replayed).
 class RelaySession : public std::enable_shared_from_this<RelaySession> {
 public:
+    /// `client_codec` matches the client's transport; `h1_codec`/`h3_codec`
+    /// are both offered for the BACKEND side — the relay picks one per request
+    /// from the routed endpoint's protocol (TCP → H1, QUIC → H3).
     RelaySession(ITransportStreamPtr client, ICodec* client_codec,
-                 ICodec* backend_codec, Router* router, UpstreamPool* pool);
+                 ICodec* h1_codec, ICodec* h3_codec, Router* router,
+                 UpstreamPool* pool);
 
     /// Begin relaying (enters the Request phase).
     void start();
@@ -62,7 +66,9 @@ private:
     ITransportStreamPtr client_;
     ITransportStreamPtr backend_;
     ICodec* client_codec_;  // owned by ProxyCore, outlives this
-    ICodec* backend_codec_; // owned by ProxyCore, outlives this
+    ICodec* h1_codec_;      // backend-side codecs, owned by ProxyCore
+    ICodec* h3_codec_;
+    ICodec* backend_codec_; // current backend codec (set in use_backend)
     Router* router_;
     UpstreamPool* pool_;
 

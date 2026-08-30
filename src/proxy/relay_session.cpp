@@ -7,11 +7,13 @@
 namespace ebpf_quic_proxy {
 
 RelaySession::RelaySession(ITransportStreamPtr client, ICodec* client_codec,
-                           ICodec* backend_codec, Router* router,
+                           ICodec* h1_codec, ICodec* h3_codec, Router* router,
                            UpstreamPool* pool)
     : client_(std::move(client)),
       client_codec_(client_codec),
-      backend_codec_(backend_codec),
+      h1_codec_(h1_codec),
+      h3_codec_(h3_codec),
+      backend_codec_(h1_codec), // default; use_backend may switch to h3
       router_(router),
       pool_(pool) {}
 
@@ -140,7 +142,14 @@ void RelaySession::use_backend(asio::error_code ec,
     }
     backend_ = std::move(upstream);
     backend_endpoint_ = endpoint;
+    // Pick the backend codec from the endpoint's protocol: QUIC upstream
+    // speaks HTTP/3, TCP speaks HTTP/1.1.
+    backend_codec_ =
+        (endpoint.protocol == TransportProtocol::QUIC) ? h3_codec_ : h1_codec_;
     backend_from_pool_ = from_pool;
+    spdlog::debug("relay: backend connected {}:{} (from_pool={}, proto={})",
+                  endpoint.host, endpoint.port, from_pool,
+                  endpoint.protocol == TransportProtocol::QUIC ? "h3" : "h1");
     pending_head_ = std::make_shared<HttpRequestHead>(std::move(head));
     pending_body_ = std::move(body);
     send_backend_request(/*retry_allowed=*/true);
@@ -271,6 +280,7 @@ void RelaySession::send_backend_request(bool retry_allowed) {
             }
             pending_head_.reset();
             pending_body_.reset();
+            spdlog::debug("relay: backend request written");
             response_phase();
         });
 }
@@ -311,6 +321,8 @@ void RelaySession::response_phase() {
             if (request_method_ == "HEAD")
                 resp_body = nullptr;
 
+            spdlog::debug("relay: backend response {} {}", resp.status_code,
+                          resp.reason);
             // Re-serialize the status line with the CLIENT's version (the
             // backend's version described the backend connection).  H1 write
             // preserves it; H3 write ignores it.
