@@ -1,5 +1,4 @@
 #include "quic_transport.h"
-#include "codec/http_message.h"
 extern "C" {
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -171,12 +170,16 @@ bool QuicTransportStream::async_send_headers(const HeaderList& headers,
         .headers = arr.data(),
     };
     // send_headers encodes synchronously into the stream; the arrays only
-    // need to outlive this call.
+    // need to outlive this call.  Flush afterwards: for a headers-only message
+    // (e.g. a GET with no body, or a response with none) nothing else triggers
+    // transmission — without this, the request never reaches the peer.
     int r = lsquic_stream_send_headers(stream_, &hs, 0);
-    if (r == 0)
+    if (r == 0) {
+        lsquic_stream_flush(stream_);
         cb({}, 0);
-    else
+    } else {
         cb(asio::error::eof, 0);
+    }
     return true;
 }
 
@@ -282,57 +285,6 @@ void QuicTransportStream::pump_write() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HTTP/3 header-set interface (HSI, ADR-8)
-// ═══════════════════════════════════════════════════════════
-
-void* QuicTransportListener::hsi_create(void*, lsquic_stream_t*, int) {
-    return new QuicH3HeaderSet();
-}
-
-struct lsxpack_header*
-QuicTransportListener::hsi_prepare_decode(void* hset, struct lsxpack_header* hdr,
-                                          size_t space) {
-    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
-    if (hdr) {
-        // We don't grow the decode buffer — fail the decode.
-        return nullptr;
-    }
-    if (hs->have_xhdr)
-        hs->decode_off += lsxpack_header_get_dec_size(&hs->xhdr);
-    else
-        hs->have_xhdr = true;
-    if (hs->decode_off + space > hs->decode_buf.size()) {
-        spdlog::warn("QUIC HSI: decode buffer too small (need {}, have {})",
-                     space, hs->decode_buf.size() - hs->decode_off);
-        return nullptr;
-    }
-    lsxpack_header_prepare_decode(&hs->xhdr, hs->decode_buf.data(),
-                                  hs->decode_off,
-                                  hs->decode_buf.size() - hs->decode_off);
-    return &hs->xhdr;
-}
-
-int QuicTransportListener::hsi_process(void* hset, struct lsxpack_header* hdr) {
-    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
-    if (!hdr)
-        return 0; // header set complete
-    const char* name = lsxpack_header_get_name(hdr);
-    const char* value = lsxpack_header_get_value(hdr);
-    if (!name || !value)
-        return -1;
-    // Keep every field, pseudo-headers included, in wire order.  Pseudo-header
-    // interpretation (which are request vs response, what they mean) is the
-    // codec's job, not the transport's.
-    hs->headers.emplace_back(std::string(name, hdr->name_len),
-                             std::string(value, hdr->val_len));
-    return 0;
-}
-
-void QuicTransportListener::hsi_discard(void* hset) {
-    delete static_cast<QuicH3HeaderSet*>(hset);
-}
-
-// ═══════════════════════════════════════════════════════════
 // QuicTransportSession
 // ═══════════════════════════════════════════════════════════
 
@@ -368,6 +320,15 @@ ITransportStreamPtr QuicTransportSession::open_stream() {
     return nullptr;
 }
 
+void QuicTransportSession::async_open_stream(
+    std::function<void(ITransportStreamPtr)> cb) {
+    set_new_stream_cb(std::move(cb));
+    if (conn_)
+        lsquic_conn_make_stream(conn_);
+    // The stream is delivered via on_new_stream — promptly for an established
+    // conn, after the handshake for a fresh one.
+}
+
 void QuicTransportSession::close() {
     if (conn_ && !closed_) {
         closed_ = true;
@@ -378,17 +339,288 @@ void QuicTransportSession::close() {
 std::string QuicTransportSession::remote_addr() const { return remote_addr_; }
 
 void QuicTransportSession::on_new_stream(lsquic_stream_t* lsquic_stream) {
-    if (new_stream_cb_) {
+    if (!new_stream_cb_)
+        return;
+    if (lsquic_stream) {
         auto stream = std::make_shared<QuicTransportStream>(lsquic_stream);
         stream->adopt_self(); // same self-ownership as the session
         new_stream_cb_(std::move(stream));
+    } else {
+        // lsquic calls on_new_stream with a NULL stream when the connection
+        // is going away while a stream was requested (client role).  Pass the
+        // NULL through so the pool can fail the pending open instead of hanging.
+        new_stream_cb_(nullptr);
     }
 }
 
 void QuicTransportSession::on_closed() {
     closed_ = true;
-    conn_ = nullptr;
+    if (conn_) {
+        // Clear the conn_ctx BEFORE lsquic destroys the connection — lsquic
+        // asserts cn_conn_ctx == NULL in ietf_full_conn_ci_destroy (we saw
+        // this abort once a connection was actually closed during a run).
+        lsquic_conn_set_ctx(conn_, nullptr);
+        conn_ = nullptr;
+    }
+    if (closed_cb_) {
+        auto cb = std::move(closed_cb_);
+        closed_cb_ = nullptr;
+        cb(); // pool drops this connection from its reuse table
+    }
 }
+
+// ═══════════════════════════════════════════════════════════
+// Shared glue — role-agnostic helpers and lsquic callbacks
+// ═══════════════════════════════════════════════════════════
+
+namespace {
+
+/// One-time global QUIC/TLS init.  Needs BOTH roles: the server engine and the
+/// client engine coexist in this process (and the client engine may be created
+/// without a QUIC listener ever existing).
+void ensure_quic_global_init() {
+    static bool s_inited = false;
+    if (s_inited)
+        return;
+    if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER | LSQUIC_GLOBAL_CLIENT)) {
+        spdlog::error("QUIC: lsquic_global_init failed");
+        throw std::runtime_error("lsquic_global_init");
+    }
+    s_inited = true;
+    spdlog::info("QUIC global init done (server + client)");
+}
+
+// ── address helpers ───────────────────────────────────────
+
+void to_sockaddr(const asio::ip::udp::endpoint& ep,
+                 struct sockaddr_storage* sa) {
+    std::memset(sa, 0, sizeof(*sa));
+    if (ep.address().is_v4()) {
+        auto* sin = reinterpret_cast<struct sockaddr_in*>(sa);
+        sin->sin_family = AF_INET;
+        sin->sin_port   = htons(ep.port());
+        auto bytes = ep.address().to_v4().to_bytes();
+        std::memcpy(&sin->sin_addr, bytes.data(), 4);
+    } else {
+        auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(sa);
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_port   = htons(ep.port());
+        auto bytes = ep.address().to_v6().to_bytes();
+        std::memcpy(&sin6->sin6_addr, bytes.data(), 16);
+    }
+}
+
+std::string conn_peer_addr(lsquic_conn_t* conn) {
+    const struct sockaddr *local, *peer;
+    lsquic_conn_get_sockaddr(conn, &local, &peer);
+    if (!peer)
+        return "unknown";
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (peer->sa_family == AF_INET) {
+        inet_ntop(AF_INET, &reinterpret_cast<const struct sockaddr_in*>(peer)
+                                ->sin_addr,
+                  buf, sizeof(buf));
+    } else if (peer->sa_family == AF_INET6) {
+        inet_ntop(AF_INET6, &reinterpret_cast<const struct sockaddr_in6*>(peer)
+                                ->sin6_addr,
+                  buf, sizeof(buf));
+    }
+    return buf[0] ? buf : "unknown";
+}
+
+// ── UDP send ──────────────────────────────────────────────
+
+/// Send a batch of lsquic out-specs as UDP datagrams on `fd`.  Returns how
+/// many were sent; `*blocked` is set if any hit EAGAIN — lsquic retains the
+/// unsent packets and expects lsquic_engine_send_unsent_packets() once the
+/// socket drains.
+unsigned send_specs(int fd, const lsquic_out_spec* specs, unsigned count,
+                    bool* blocked) {
+    unsigned sent = 0;
+    *blocked = false;
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& spec = specs[i];
+        // sendmsg (scatter-gather): all iovs in this spec go out as a single
+        // UDP datagram, matching lsquic's expectation.
+        struct msghdr hdr = {};
+        hdr.msg_name    = const_cast<struct sockaddr*>(spec.dest_sa);
+        hdr.msg_namelen = spec.dest_sa->sa_family == AF_INET
+                              ? sizeof(struct sockaddr_in)
+                              : sizeof(struct sockaddr_in6);
+        hdr.msg_iov     = const_cast<struct iovec*>(spec.iov);
+        hdr.msg_iovlen  = spec.iovlen;
+        // msg_control, msg_controllen left as 0 — no ancillary data.
+
+        ssize_t n = sendmsg(fd, &hdr, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                spdlog::debug("QUIC sendmsg would block — will retry on writable");
+                *blocked = true;
+            } else {
+                spdlog::debug("QUIC sendmsg failed: {} (errno={})",
+                              strerror(errno), errno);
+            }
+        } else {
+            ++sent;
+        }
+    }
+    return sent;
+}
+
+// ── HTTP/3 header-set interface (HSI, ADR-8) ──────────────
+// Shared by both engines: the server decodes request headers, the client
+// decodes response headers, into the same QuicH3HeaderSet.
+
+void* hsi_create(void*, lsquic_stream_t*, int) {
+    return new QuicH3HeaderSet();
+}
+
+struct lsxpack_header* hsi_prepare_decode(void* hset,
+                                          struct lsxpack_header* hdr,
+                                          size_t space) {
+    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
+    if (hdr) {
+        // We don't grow the decode buffer — fail the decode.
+        return nullptr;
+    }
+    if (hs->have_xhdr)
+        hs->decode_off += lsxpack_header_get_dec_size(&hs->xhdr);
+    else
+        hs->have_xhdr = true;
+    if (hs->decode_off + space > hs->decode_buf.size()) {
+        spdlog::warn("QUIC HSI: decode buffer too small (need {}, have {})",
+                     space, hs->decode_buf.size() - hs->decode_off);
+        return nullptr;
+    }
+    lsxpack_header_prepare_decode(&hs->xhdr, hs->decode_buf.data(),
+                                  hs->decode_off,
+                                  hs->decode_buf.size() - hs->decode_off);
+    return &hs->xhdr;
+}
+
+int hsi_process(void* hset, struct lsxpack_header* hdr) {
+    auto* hs = static_cast<QuicH3HeaderSet*>(hset);
+    if (!hdr)
+        return 0; // header set complete
+    const char* name = lsxpack_header_get_name(hdr);
+    const char* value = lsxpack_header_get_value(hdr);
+    if (!name || !value)
+        return -1;
+    // Keep every field, pseudo-headers included, in wire order.  Pseudo-header
+    // interpretation (request vs response, what they mean) is the codec's job,
+    // not the transport's.
+    hs->headers.emplace_back(std::string(name, hdr->name_len),
+                             std::string(value, hdr->val_len));
+    return 0;
+}
+
+void hsi_discard(void* hset) {
+    delete static_cast<QuicH3HeaderSet*>(hset);
+}
+
+const struct lsquic_hset_if kHsiIf = {
+    .hsi_create_header_set  = hsi_create,
+    .hsi_prepare_decode     = hsi_prepare_decode,
+    .hsi_process_header     = hsi_process,
+    .hsi_discard_header_set = hsi_discard,
+    .hsi_flags              = (enum lsquic_hsi_flag)0,
+};
+
+// ── stream / conn callbacks (role-agnostic) ───────────────
+
+lsquic_stream_ctx_t* new_stream_cb(void*, lsquic_stream_t* stream) {
+    auto* conn = lsquic_stream_conn(stream);
+    spdlog::debug("QUIC on_new_stream (stream={})",
+                  reinterpret_cast<void*>(stream));
+    // conn_ctx IS the QuicTransportSession (server or client role) — no
+    // registry lookup needed.
+    auto* session = reinterpret_cast<QuicTransportSession*>(
+        lsquic_conn_get_ctx(conn));
+    if (session) {
+        session->on_new_stream(stream);
+        // Stream context is stored inside the QuicTransportStream ctor.
+        return reinterpret_cast<lsquic_stream_ctx_t*>(
+            lsquic_stream_get_ctx(stream));
+    }
+    return nullptr;
+}
+
+void conn_closed_cb(lsquic_conn_t* conn) {
+    auto* ctx = lsquic_conn_get_ctx(conn);
+    if (!ctx)
+        return;
+    auto* session = reinterpret_cast<QuicTransportSession*>(ctx);
+    // This is lsquic's LAST callback for this connection: after it returns
+    // the conn is freed and the ctx is never handed back again.  Keep a copy
+    // of the self-referential shared_ptr across on_closed()/release_self()
+    // so the session is not destroyed while still inside its own member
+    // function — the copy is dropped as this callback returns.
+    auto keep_alive = session->shared_from_this();
+    session->on_closed();    // mark closed + notify the pool's closed_cb
+    session->release_self(); // drop self-ownership; destroyed once keep_alive goes away
+}
+
+void read_cb(lsquic_stream_t* stream, lsquic_stream_ctx_t* ctx) {
+    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
+    if (qstream)
+        qstream->on_readable();
+}
+
+void write_cb(lsquic_stream_t* stream, lsquic_stream_ctx_t* ctx) {
+    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
+    if (qstream)
+        qstream->on_writeable();
+}
+
+void close_cb(lsquic_stream_t* stream, lsquic_stream_ctx_t* ctx) {
+    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
+    if (!qstream)
+        return;
+    // on_close() releases the stream's self-reference; keep a copy so the
+    // wrapper is not destroyed while still inside its own member function.
+    auto keep_alive = qstream->shared_from_this();
+    qstream->on_close();
+}
+
+void reset_cb(lsquic_stream_t* stream, lsquic_stream_ctx_t* ctx, int how) {
+    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
+    if (qstream)
+        qstream->on_reset(how);
+}
+
+/// Client-only: handshake completed (or failed).  Informational for now — the
+/// pool learns a connection is usable because its first stream arrives via
+/// on_new_stream once the handshake is done.
+void hsk_done_cb(lsquic_conn_t* conn, enum lsquic_hsk_status status) {
+    spdlog::info("QUIC handshake done (conn={}, status={})",
+                 reinterpret_cast<void*>(conn), static_cast<int>(status));
+}
+
+} // namespace
+
+// ── per-role stream interfaces ─────────────────────────────
+
+static const struct lsquic_stream_if kServerStreamIf = {
+    .on_new_conn    = QuicTransportListener::on_new_conn_cb,
+    .on_conn_closed = conn_closed_cb,
+    .on_new_stream  = new_stream_cb,
+    .on_read        = read_cb,
+    .on_write       = write_cb,
+    .on_close       = close_cb,
+    .on_reset       = reset_cb,
+    .on_hsk_done    = hsk_done_cb,
+};
+
+static const struct lsquic_stream_if kClientStreamIf = {
+    .on_new_conn    = QuicClientEngine::on_new_conn_cb,
+    .on_conn_closed = conn_closed_cb,
+    .on_new_stream  = new_stream_cb,
+    .on_read        = read_cb,
+    .on_write       = write_cb,
+    .on_close       = close_cb,
+    .on_reset       = reset_cb,
+    .on_hsk_done    = hsk_done_cb,
+};
 
 // ═══════════════════════════════════════════════════════════
 // QuicTransportListener
@@ -403,51 +635,19 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
       tick_timer_(io),
       raw_fd_(socket_.native_handle()) {
 
-    // ── Build lsquic engine ───────────────────────────────
-    // One-time global QUIC/TLS init (needed exactly once per process).
-    static bool s_global_inited = false;
-    if (!s_global_inited) {
-        if (0 != lsquic_global_init(LSQUIC_GLOBAL_SERVER)) {
-            spdlog::error("QUIC: lsquic_global_init failed");
-            throw std::runtime_error("lsquic_global_init");
-        }
-        s_global_inited = true;
-        spdlog::info("QUIC global init done");
-    }
+    ensure_quic_global_init();
 
     // Load TLS certificate.
     cert_file_ = cert_file;
     key_file_  = key_file;
     load_tls_cert();
 
-    // Stream callbacks.
-    static struct lsquic_stream_if stream_if = {
-        .on_new_conn    = on_new_conn_cb,
-        .on_conn_closed = on_conn_closed_cb,
-        .on_new_stream  = on_new_stream_cb,
-        .on_read        = on_read_cb,
-        .on_write       = on_write_cb,
-        .on_close       = on_close_cb,
-        .on_reset       = on_reset_cb,
-    };
-
-    // HSI interface (ADR-8, route B): lsquic decodes QPACK request headers
-    // into a QuicH3HeaderSet we allocate; the stream later claims it via
-    // lsquic_stream_get_hset() (see QuicTransportStream::try_take_headers).
-    static const struct lsquic_hset_if kHsiIf = {
-        .hsi_create_header_set  = QuicTransportListener::hsi_create,
-        .hsi_prepare_decode     = QuicTransportListener::hsi_prepare_decode,
-        .hsi_process_header     = QuicTransportListener::hsi_process,
-        .hsi_discard_header_set = QuicTransportListener::hsi_discard,
-        .hsi_flags              = (enum lsquic_hsi_flag)0,
-    };
-
     struct lsquic_engine_api api = {};
-    api.ea_hsi_if         = &kHsiIf;
-    api.ea_hsi_ctx        = nullptr;
+    api.ea_hsi_if          = &kHsiIf;
+    api.ea_hsi_ctx         = nullptr;
     api.ea_packets_out     = on_packets_out_cb;
     api.ea_packets_out_ctx = this;
-    api.ea_stream_if       = &stream_if;
+    api.ea_stream_if       = &kServerStreamIf;
     api.ea_stream_if_ctx   = this;
     api.ea_lookup_cert     = lookup_cert_cb;
     api.ea_cert_lu_ctx     = this;
@@ -514,25 +714,6 @@ void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
     spdlog::debug("QUIC UDP recv {} bytes from {}", n,
                   recv_endpoint_.address().to_string());
 
-    // Convert asio endpoints to sockaddr for lsquic.
-    auto to_sockaddr = [](const asio::ip::udp::endpoint& ep,
-                          struct sockaddr_storage* sa) {
-        std::memset(sa, 0, sizeof(*sa));
-        if (ep.address().is_v4()) {
-            auto* sin = reinterpret_cast<struct sockaddr_in*>(sa);
-            sin->sin_family = AF_INET;
-            sin->sin_port   = htons(ep.port());
-            auto bytes = ep.address().to_v4().to_bytes();
-            std::memcpy(&sin->sin_addr, bytes.data(), 4);
-        } else {
-            auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(sa);
-            sin6->sin6_family = AF_INET6;
-            sin6->sin6_port   = htons(ep.port());
-            auto bytes = ep.address().to_v6().to_bytes();
-            std::memcpy(&sin6->sin6_addr, bytes.data(), 16);
-        }
-    };
-
     struct sockaddr_storage local_sa, peer_sa;
     to_sockaddr(socket_.local_endpoint(), &local_sa);
     to_sockaddr(recv_endpoint_, &peer_sa);
@@ -583,27 +764,12 @@ void QuicTransportListener::on_tick(asio::error_code ec) {
     schedule_tick();
 }
 
-// ── lsquic callbacks ──────────────────────────────────────
+// ── lsquic callbacks (server-role) ────────────────────────
 
 lsquic_conn_ctx_t*
 QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     auto* listener = static_cast<QuicTransportListener*>(self);
-    char buf[INET6_ADDRSTRLEN] = {};
-    const struct sockaddr *local, *peer;
-    lsquic_conn_get_sockaddr(conn, &local, &peer);
-    if (peer) {
-        if (peer->sa_family == AF_INET)
-            inet_ntop(AF_INET,
-                      &reinterpret_cast<const struct sockaddr_in*>(peer)
-                          ->sin_addr,
-                      buf, sizeof(buf));
-        else if (peer->sa_family == AF_INET6)
-            inet_ntop(AF_INET6,
-                      &reinterpret_cast<const struct sockaddr_in6*>(peer)
-                          ->sin6_addr,
-                      buf, sizeof(buf));
-    }
-    std::string addr = buf[0] ? buf : "unknown";
+    std::string addr = conn_peer_addr(conn);
 
     spdlog::debug("QUIC on_new_conn from {} (conn={})", addr,
                   reinterpret_cast<void*>(conn));
@@ -623,111 +789,17 @@ QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     return ctx;
 }
 
-void QuicTransportListener::on_conn_closed_cb(lsquic_conn_t* conn) {
-    auto* ctx = lsquic_conn_get_ctx(conn);
-    if (!ctx)
-        return;
-    auto* session = reinterpret_cast<QuicTransportSession*>(ctx);
-    // This is lsquic's LAST callback for this connection: after it returns
-    // the conn is freed and the ctx is never handed back again.  Keep a copy
-    // of the self-referential shared_ptr across on_closed()/release_self()
-    // so the session is not destroyed while still inside its own member
-    // function — the copy is dropped as this callback returns, which is
-    // exactly when lsquic stops referencing the conn.
-    auto keep_alive = session->shared_from_this();
-    session->on_closed();    // mark closed, conn_ = nullptr
-    session->release_self(); // drop self-ownership; destroyed once keep_alive goes away
-}
-
-lsquic_stream_ctx_t*
-QuicTransportListener::on_new_stream_cb(void* self, lsquic_stream_t* stream) {
-    auto* listener = static_cast<QuicTransportListener*>(self);
-    auto* conn = lsquic_stream_conn(stream);
-    spdlog::debug("QUIC on_new_stream (stream={})", reinterpret_cast<void*>(stream));
-    auto* session = listener->find_session(conn);
-    if (session) {
-        session->on_new_stream(stream);
-        // Stream context is stored inside QuicTransportStream constructor.
-        auto* ctx = lsquic_stream_get_ctx(stream);
-        return reinterpret_cast<lsquic_stream_ctx_t*>(ctx);
-    }
-    return nullptr;
-}
-
-void QuicTransportListener::on_read_cb(lsquic_stream_t* stream,
-                                        lsquic_stream_ctx_t* ctx) {
-    spdlog::debug("QUIC on_read (stream={})", reinterpret_cast<void*>(stream));
-    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
-    if (qstream)
-        qstream->on_readable();
-}
-
-void QuicTransportListener::on_write_cb(lsquic_stream_t* stream,
-                                         lsquic_stream_ctx_t* ctx) {
-    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
-    if (qstream)
-        qstream->on_writeable();
-}
-
-void QuicTransportListener::on_close_cb(lsquic_stream_t* stream,
-                                         lsquic_stream_ctx_t* ctx) {
-    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
-    if (!qstream)
-        return;
-    // on_close() releases the stream's self-reference; keep a copy so the
-    // wrapper is not destroyed while still inside its own member function.
-    auto keep_alive = qstream->shared_from_this();
-    qstream->on_close();
-}
-
-void QuicTransportListener::on_reset_cb(lsquic_stream_t* stream,
-                                         lsquic_stream_ctx_t* ctx, int how) {
-    auto* qstream = reinterpret_cast<QuicTransportStream*>(ctx);
-    if (qstream)
-        qstream->on_reset(how);
-}
-
 int QuicTransportListener::on_packets_out_cb(void* self,
-                                              const lsquic_out_spec* specs,
-                                              unsigned count) {
+                                             const lsquic_out_spec* specs,
+                                             unsigned count) {
     auto* listener = static_cast<QuicTransportListener*>(self);
-    unsigned sent = 0;
-
     spdlog::debug("QUIC packets_out: {} specs", count);
 
-    for (unsigned i = 0; i < count; ++i) {
-        auto& spec = specs[i];
-
-        // Use sendmsg (scatter-gather) so all iovs in this spec
-        // go out as a single UDP datagram, matching lsquic's expectation.
-        struct msghdr hdr = {};
-        hdr.msg_name       = const_cast<struct sockaddr*>(spec.dest_sa);
-        hdr.msg_namelen    = spec.dest_sa->sa_family == AF_INET
-                                 ? sizeof(struct sockaddr_in)
-                                 : sizeof(struct sockaddr_in6);
-        hdr.msg_iov        = const_cast<struct iovec*>(spec.iov);
-        hdr.msg_iovlen     = spec.iovlen;
-        // msg_control, msg_controllen left as 0 — no ancillary data
-
-        ssize_t n = sendmsg(listener->raw_fd_, &hdr, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // UDP send buffer is full.  lsquic keeps the unsent packets
-                // and expects us to call lsquic_engine_send_unsent_packets()
-                // once the socket drains — otherwise those packets sit
-                // forever and the connection stalls/expires.
-                spdlog::debug("QUIC sendmsg would block — will retry on writable");
-                listener->arm_send_retry();
-            } else {
-                spdlog::debug("QUIC sendmsg failed: {} (errno={})",
-                              strerror(errno), errno);
-            }
-        } else {
-            ++sent;
-        }
-    }
-
-    return sent;  // tell lsquic how many packets were actually sent
+    bool blocked = false;
+    unsigned sent = send_specs(listener->raw_fd_, specs, count, &blocked);
+    if (blocked)
+        listener->arm_send_retry();
+    return static_cast<int>(sent); // tell lsquic how many were actually sent
 }
 
 void QuicTransportListener::arm_send_retry() {
@@ -748,21 +820,6 @@ void QuicTransportListener::arm_send_retry() {
             if (engine_ && lsquic_engine_has_unsent_packets(engine_))
                 arm_send_retry();
         });
-}
-
-// ── Lookup helpers ────────────────────────────────────────
-
-QuicTransportSession*
-QuicTransportListener::find_session(lsquic_conn_t* conn) {
-    // conn_ctx IS the QuicTransportSession — no registry lookup needed.
-    auto* ctx = lsquic_conn_get_ctx(conn);
-    return reinterpret_cast<QuicTransportSession*>(ctx);
-}
-
-QuicTransportStream*
-QuicTransportListener::find_stream(lsquic_stream_t* stream) {
-    auto* ctx = lsquic_stream_get_ctx(stream);
-    return reinterpret_cast<QuicTransportStream*>(ctx);
 }
 
 // ── TLS cert loading ──────────────────────────────────────
@@ -843,6 +900,236 @@ QuicTransportListener::get_ssl_ctx_cb(void* peer_ctx,
     spdlog::debug("QUIC get_ssl_ctx_cb peer_ctx={} ssl_ctx={}",
                   peer_ctx, static_cast<void*>(s_ssl_ctx_));
     return s_ssl_ctx_;
+}
+
+// ═══════════════════════════════════════════════════════════
+// QuicClientEngine
+// ═══════════════════════════════════════════════════════════
+
+QuicClientEngine::QuicClientEngine(asio::io_context& io)
+    : io_(io),
+      socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0)),
+      tick_timer_(io),
+      raw_fd_(socket_.native_handle()) {
+
+    ensure_quic_global_init();
+
+    // Client TLS context: TLS 1.3, no server certificate needed, and — because
+    // ea_verify_cert stays NULL below — NO server-cert verification (the
+    // curl -k equivalent).  The upstream for this demo is a self-signed server.
+    ssl_ctx_ = SSL_CTX_new(TLS_method());
+    if (ssl_ctx_) {
+        SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
+        s_client_ssl_ctx_ = ssl_ctx_;
+    }
+
+    struct lsquic_engine_settings settings;
+    lsquic_engine_init_settings(&settings, LSENG_HTTP);
+    struct lsquic_engine_api api = {};
+    api.ea_settings         = &settings;
+    api.ea_stream_if        = &kClientStreamIf;
+    api.ea_stream_if_ctx    = this;
+    api.ea_hsi_if           = &kHsiIf;   // decode response headers via QPACK
+    api.ea_packets_out      = on_packets_out_cb;
+    api.ea_packets_out_ctx  = this;
+    api.ea_get_ssl_ctx      = get_ssl_ctx_cb;
+    // ea_verify_cert NOT set → skip server-cert verification.
+
+    engine_ = lsquic_engine_new(LSENG_HTTP, &api);
+    if (!engine_)
+        throw std::runtime_error("Failed to create QUIC client engine");
+
+    spdlog::info("QUIC client engine created (local port {})",
+                 socket_.local_endpoint().port());
+}
+
+QuicClientEngine::~QuicClientEngine() {
+    if (engine_) {
+        lsquic_engine_destroy(engine_);
+        engine_ = nullptr;
+    }
+    if (ssl_ctx_) {
+        auto* ctx = ssl_ctx_;
+        ssl_ctx_ = nullptr;
+        s_client_ssl_ctx_ = nullptr;
+        SSL_CTX_free(ctx);
+    }
+}
+
+void QuicClientEngine::set_new_session_cb(NewClientSessionCallback cb) {
+    new_session_cb_ = std::move(cb);
+}
+
+void QuicClientEngine::start() {
+    do_recv();
+    schedule_tick();
+}
+
+bool QuicClientEngine::connect(const BackendEndpoint& ep) {
+    if (!engine_)
+        return false;
+    if (!started_) { // lazy start: arm the recv loop before the handshake can
+        start();     // produce packets
+        started_ = true;
+    }
+
+    // Resolve the upstream host.  A short blocking resolve on the event-loop
+    // thread is acceptable here (same as the TCP pool's connect path).
+    asio::ip::udp::resolver resolver(io_);
+    asio::error_code ec;
+    auto results = resolver.resolve(ep.host, std::to_string(ep.port), ec);
+    if (ec || results.empty()) {
+        spdlog::warn("QUIC client: resolve {}:{} failed: {}", ep.host,
+                     ep.port, ec.message());
+        return false;
+    }
+    asio::ip::udp::endpoint peer = *results.begin();
+
+    struct sockaddr_storage local_sa, peer_sa;
+    to_sockaddr(socket_.local_endpoint(), &local_sa);
+    to_sockaddr(peer, &peer_sa);
+
+    // Stash the endpoint so the SYNCHRONOUS on_new_conn (fires inside
+    // lsquic_engine_connect) can attach it to the session.
+    current_connect_ep_ = ep;
+    lsquic_conn_t* conn = lsquic_engine_connect(
+        engine_, N_LSQVER,                                // let the engine pick version
+        reinterpret_cast<const struct sockaddr*>(&local_sa),
+        reinterpret_cast<const struct sockaddr*>(&peer_sa),
+        nullptr,              // peer_ctx
+        nullptr,              // conn_ctx — on_new_conn's return value becomes it
+        ep.host.c_str(),      // hostname → TLS SNI (required for HTTP)
+        0,                    // base_plpmtu — auto
+        nullptr, 0,           // sess_resume
+        nullptr, 0);          // token
+    if (!conn) {
+        spdlog::warn("QUIC client: lsquic_engine_connect failed for {}:{}",
+                     ep.host, ep.port);
+        current_connect_ep_ = {};
+        return false;
+    }
+
+    // Flush the ClientHello (and any other handshake packets).
+    lsquic_engine_process_conns(engine_);
+    schedule_tick();
+    return true;
+}
+
+// ── UDP receive loop ──────────────────────────────────────
+
+void QuicClientEngine::do_recv() {
+    socket_.async_receive_from(
+        asio::buffer(recv_buf_), recv_endpoint_,
+        [this](asio::error_code ec, std::size_t n) { on_packet(ec, n); });
+}
+
+void QuicClientEngine::on_packet(asio::error_code ec, std::size_t n) {
+    if (ec) {
+        if (ec == asio::error::operation_aborted)
+            return;
+        spdlog::warn("QUIC client UDP recv error: {} — re-arming", ec.message());
+        if (socket_.is_open())
+            do_recv();
+        return;
+    }
+
+    spdlog::debug("QUIC[client] UDP recv {} bytes from {}", n,
+                  recv_endpoint_.address().to_string());
+
+    struct sockaddr_storage local_sa, peer_sa;
+    to_sockaddr(socket_.local_endpoint(), &local_sa);
+    to_sockaddr(recv_endpoint_, &peer_sa);
+
+    int r = lsquic_engine_packet_in(
+        engine_, reinterpret_cast<const unsigned char*>(recv_buf_.data()), n,
+        reinterpret_cast<const struct sockaddr*>(&local_sa),
+        reinterpret_cast<const struct sockaddr*>(&peer_sa),
+        nullptr, 0);
+    if (r < 0)
+        spdlog::warn("QUIC client packet_in returned {}", r);
+
+    lsquic_engine_process_conns(engine_);
+    schedule_tick();
+    do_recv();
+}
+
+// ── Tick timer ────────────────────────────────────────────
+
+void QuicClientEngine::schedule_tick() {
+    int diff = 0;
+    unsigned next = lsquic_engine_earliest_adv_tick(engine_, &diff);
+    if (diff < 0) {
+        tick_timer_.expires_after(std::chrono::milliseconds(0));
+    } else if (next == 0 || (unsigned)diff > 500) {
+        tick_timer_.expires_after(std::chrono::milliseconds(500));
+    } else {
+        tick_timer_.expires_after(std::chrono::milliseconds(diff));
+    }
+    tick_timer_.async_wait([this](asio::error_code ec) { on_tick(ec); });
+}
+
+void QuicClientEngine::on_tick(asio::error_code ec) {
+    if (ec)
+        return;
+    lsquic_engine_process_conns(engine_);
+    schedule_tick();
+}
+
+// ── lsquic callbacks (client-role) ────────────────────────
+
+lsquic_conn_ctx_t*
+QuicClientEngine::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
+    auto* engine = static_cast<QuicClientEngine*>(self);
+    // The endpoint was stashed before lsquic_engine_connect (synchronous).
+    BackendEndpoint ep = std::move(engine->current_connect_ep_);
+
+    auto session = std::make_shared<QuicTransportSession>(conn,
+                                                          conn_peer_addr(conn));
+    session->set_endpoint(ep);
+    session->adopt_self();
+    auto* ctx = reinterpret_cast<lsquic_conn_ctx_t*>(session.get());
+
+    if (engine->new_session_cb_) {
+        spdlog::debug("QUIC client conn to {}:{} (conn={})", ep.host, ep.port,
+                      reinterpret_cast<void*>(conn));
+        engine->new_session_cb_(session);
+    }
+    return ctx;
+}
+
+int QuicClientEngine::on_packets_out_cb(void* self,
+                                        const lsquic_out_spec* specs,
+                                        unsigned count) {
+    auto* engine = static_cast<QuicClientEngine*>(self);
+    spdlog::debug("QUIC[client] packets_out: {} specs", count);
+    bool blocked = false;
+    unsigned sent = send_specs(engine->raw_fd_, specs, count, &blocked);
+    if (blocked)
+        engine->arm_send_retry();
+    return static_cast<int>(sent);
+}
+
+void QuicClientEngine::arm_send_retry() {
+    if (send_retry_armed_ || !socket_.is_open())
+        return;
+    send_retry_armed_ = true;
+    socket_.async_wait(
+        asio::ip::udp::socket::wait_write,
+        [this](asio::error_code ec) {
+            send_retry_armed_ = false;
+            if (ec)
+                return;
+            if (engine_)
+                lsquic_engine_send_unsent_packets(engine_);
+            if (engine_ && lsquic_engine_has_unsent_packets(engine_))
+                arm_send_retry();
+        });
+}
+
+struct ssl_ctx_st*
+QuicClientEngine::get_ssl_ctx_cb(void*, const struct sockaddr*) {
+    return s_client_ssl_ctx_;
 }
 
 } // namespace ebpf_quic_proxy

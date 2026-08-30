@@ -1,5 +1,6 @@
 #pragma once
 
+#include "config.h"
 #include "itransport_stream.h"
 #include "itransport_session.h"
 extern "C" {
@@ -132,6 +133,23 @@ public:
     void on_new_stream(lsquic_stream_t* lsquic_stream);
     void on_closed();
 
+    // ── client-role hooks (used by the QUIC upstream pool) ──
+    /// Which upstream endpoint this connection is for (set by the client
+    /// engine's on_new_conn; unused for server sessions).
+    void set_endpoint(const BackendEndpoint& ep) { endpoint_ = ep; }
+    const BackendEndpoint& endpoint() const { return endpoint_; }
+
+    /// Open one outbound request stream on this connection.  `cb` fires with
+    /// the stream once the handshake is done (or nullptr if the connection is
+    /// going away).  For a client conn the stream is delivered via
+    /// on_new_stream after the handshake; for an established conn, promptly.
+    void async_open_stream(std::function<void(ITransportStreamPtr)> cb);
+
+    /// Fired from on_closed() — lets the pool drop this connection from its
+    /// reuse table.  The callback must NOT capture the session shared_ptr
+    /// (that would recreate the cycle we deliberately break).
+    void set_closed_cb(std::function<void()> cb) { closed_cb_ = std::move(cb); }
+
     // Self-ownership: the session holds a shared_ptr to itself for the whole
     // connection lifetime (a deliberate, breakable cycle — NOT a leak).
     //   adopt_self()  — called by on_new_conn_cb right after make_shared.
@@ -146,6 +164,8 @@ private:
     lsquic_conn_t* conn_;
     std::string remote_addr_;
     NewStreamCallback new_stream_cb_;
+    BackendEndpoint endpoint_; // client-role: which upstream this conn targets
+    std::function<void()> closed_cb_;
     bool closed_ = false;
     std::shared_ptr<QuicTransportSession> self_; // cyclic self-ownership
 };
@@ -174,6 +194,10 @@ public:
 
     /// Begin listening (start UDP recv + timer loop).
     void start();
+
+    // Referenced by the file-scope kServerStreamIf (quic_transport.cpp), so it
+    // must be public.
+    static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
 
 private:
     asio::io_context& io_;
@@ -208,35 +232,81 @@ private:
     void arm_send_retry();
     bool send_retry_armed_ = false;
 
-    // ── lsquic callbacks ──────────────────────────────────
-    static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
-    static void on_conn_closed_cb(lsquic_conn_t* conn);
-    static lsquic_stream_ctx_t* on_new_stream_cb(void* self,
-                                                  lsquic_stream_t* stream);
-    static void on_read_cb(lsquic_stream_t* stream,
-                           lsquic_stream_ctx_t* ctx);
-    static void on_write_cb(lsquic_stream_t* stream,
-                            lsquic_stream_ctx_t* ctx);
-    static void on_close_cb(lsquic_stream_t* stream,
-                            lsquic_stream_ctx_t* ctx);
-    static void on_reset_cb(lsquic_stream_t* stream,
-                            lsquic_stream_ctx_t* ctx, int how);
+    // ── lsquic callbacks (packet sending is per-engine; stream/conn callbacks
+    // are shared free functions in quic_transport.cpp) ──
     static int on_packets_out_cb(void* self,
                                  const lsquic_out_spec* specs,
                                  unsigned count);
 
     // ── HTTP/3 header-set interface (HSI, ADR-8) ──────────
-    static void* hsi_create(void* ctx, lsquic_stream_t* stream,
-                            int is_push_promise);
-    static struct lsxpack_header* hsi_prepare_decode(void* hset,
-                                                     struct lsxpack_header* hdr,
-                                                     size_t space);
-    static int hsi_process(void* hset, struct lsxpack_header* hdr);
-    static void hsi_discard(void* hset);
+    // (Implemented as shared free functions in quic_transport.cpp — both the
+    // server and the client engine use the same QPACK decoding machinery.)
+};
 
-    // Lookup helpers.
-    QuicTransportSession* find_session(lsquic_conn_t* conn);
-    QuicTransportStream* find_stream(lsquic_stream_t* stream);
+// ── QuicClientEngine ───────────────────────────────────────
+
+/// Client-role QUIC engine: initiates outbound HTTP/3 connections to upstream
+/// servers.  lsquic forbids a single engine playing both roles, so this is a
+/// second engine with its own UDP socket + drive loop; it shares the stream /
+/// session classes and the HTTP/3 header-set interface (HSI) with the server.
+///
+/// The pool drives it: connect() → (synchronously) on_new_conn → a
+/// QuicTransportSession is made and delivered via new_session_cb; the session
+/// is then reused by opening a new stream per request (multiplexing).
+class QuicClientEngine {
+public:
+    using NewClientSessionCallback =
+        std::function<void(QuicTransportSessionPtr)>;
+
+    QuicClientEngine(asio::io_context& io);
+    ~QuicClientEngine();
+
+    /// Register callback for new outbound QUIC sessions (the pool).
+    void set_new_session_cb(NewClientSessionCallback cb);
+
+    /// Begin listening (start UDP recv + timer loop).
+    void start();
+
+    /// Initiate an outbound connection to `ep`.  On success, the session is
+    /// delivered synchronously via new_session_cb (with endpoint() set) before
+    /// this returns.  Returns false if the engine refused the connect.
+    bool connect(const BackendEndpoint& ep);
+
+    // Referenced by the file-scope kClientStreamIf (quic_transport.cpp), so it
+    // must be public.
+    static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
+
+private:
+    asio::io_context& io_;
+    asio::ip::udp::socket socket_;      // bound to an ephemeral local port
+    asio::steady_timer tick_timer_;
+    int raw_fd_ = -1;                   // native fd for synchronous sendto
+    lsquic_engine_t* engine_ = nullptr;
+    NewClientSessionCallback new_session_cb_;
+    bool started_ = false;              // recv/tick loop armed on first connect
+
+    // Client TLS context (TLS1.3, no cert verification — see ea_verify_cert).
+    struct ssl_ctx_st* ssl_ctx_ = nullptr;
+    static inline struct ssl_ctx_st* s_client_ssl_ctx_ = nullptr;
+
+    // Receiving.
+    std::array<char, 65536> recv_buf_{};
+    asio::ip::udp::endpoint recv_endpoint_;
+    void do_recv();
+    void on_packet(asio::error_code ec, std::size_t n);
+    void schedule_tick();
+    void on_tick(asio::error_code ec);
+    void arm_send_retry();
+    bool send_retry_armed_ = false;
+
+    // Stashed before lsquic_engine_connect, consumed by the synchronous
+    // on_new_conn — safe because on_new_conn fires inside connect().
+    BackendEndpoint current_connect_ep_;
+
+    static struct ssl_ctx_st* get_ssl_ctx_cb(void* peer_ctx,
+                                             const struct sockaddr* local);
+    static int on_packets_out_cb(void* self, const lsquic_out_spec* specs,
+                                 unsigned count);
 };
 
 } // namespace ebpf_quic_proxy
