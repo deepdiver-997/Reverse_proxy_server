@@ -61,13 +61,24 @@ std::string make_error_response(HttpStatus status, std::string body);
 
 struct HttpRequestHead {
     std::string method;
+    /// Request-target, origin-form ("/path?query").  An H1 absolute-form
+    /// target ("GET http://host/path") is normalized here at parse time.
     std::string path;
+    /// "http"/"https" — from an H1 absolute-form target or the H3 :scheme
+    /// pseudo-header.  Empty when unknown.
+    std::string scheme;
+    /// host[:port] — from an H1 Host header / absolute-form target or the H3
+    /// :authority pseudo-header.  Used for forward-proxy direct connects.
+    std::string authority;
+    /// True when the H1 request-target was absolute-form (forward proxy) — the
+    /// relay connects straight to `authority` instead of routing by Host.
+    bool absolute_target = false;
     HeaderMap headers;
     std::optional<std::size_t> content_length;
 };
 
 struct HttpResponseHead {
-    int status_code;
+    int status_code = 0; // default — a malformed/missing status must not leak garbage
     std::string reason;
     HeaderMap headers;
     std::optional<std::size_t> content_length;

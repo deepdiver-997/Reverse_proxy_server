@@ -128,5 +128,103 @@ TEST_CASE("HeaderMap case-insensitive lookup", "[http_message]") {
     REQUIRE(h.get_all("x-custom").size() == 1);
 }
 
+// ── absolute-form (forward proxy) parsing ─────────────────
+
+TEST_CASE("H1Codec normalizes absolute-form target (forward proxy)",
+          "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>(
+        "GET http://example.com:9001/path?q=1 HTTP/1.1\r\n"
+        "Host: example.com:9001\r\n"
+        "\r\n");
+
+    H1Codec codec;
+    bool called = false;
+
+    codec.async_parse_request(
+        stream, [&](asio::error_code ec, HttpRequestHead head,
+                    BodySourcePtr, bool) {
+            called = true;
+            REQUIRE_FALSE(ec);
+            REQUIRE(head.scheme == "http");
+            REQUIRE(head.authority == "example.com:9001");
+            // The URL's path is normalized to origin-form for the backend.
+            REQUIRE(head.path == "/path?q=1");
+            REQUIRE(head.absolute_target);
+        });
+
+    REQUIRE(called);
+}
+
+TEST_CASE("H1Codec absolute-form without port / Host", "[h1_codec]") {
+    // No Host header, no port — authority comes from the URL alone.
+    auto stream = std::make_shared<MockStream>(
+        "GET http://example.com/ HTTP/1.1\r\n"
+        "\r\n");
+
+    H1Codec codec;
+    bool called = false;
+
+    codec.async_parse_request(
+        stream, [&](asio::error_code ec, HttpRequestHead head,
+                    BodySourcePtr, bool) {
+            called = true;
+            REQUIRE_FALSE(ec);
+            REQUIRE(head.scheme == "http");
+            REQUIRE(head.authority == "example.com");
+            REQUIRE(head.path == "/");
+            REQUIRE(head.absolute_target);
+        });
+
+    REQUIRE(called);
+}
+
+TEST_CASE("H1Codec records https absolute-form (relay rejects later)",
+          "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>(
+        "GET https://secure.example.com/ HTTP/1.1\r\n"
+        "Host: secure.example.com\r\n"
+        "\r\n");
+
+    H1Codec codec;
+    bool called = false;
+
+    codec.async_parse_request(
+        stream, [&](asio::error_code ec, HttpRequestHead head,
+                    BodySourcePtr, bool) {
+            called = true;
+            REQUIRE_FALSE(ec);
+            REQUIRE(head.scheme == "https");
+            REQUIRE(head.authority == "secure.example.com");
+            REQUIRE(head.path == "/");
+            REQUIRE(head.absolute_target);
+        });
+
+    REQUIRE(called);
+}
+
+TEST_CASE("H1Codec origin-form fills scheme/authority from Host",
+          "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>(
+        "GET /hello HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "\r\n");
+
+    H1Codec codec;
+    bool called = false;
+
+    codec.async_parse_request(
+        stream, [&](asio::error_code ec, HttpRequestHead head,
+                    BodySourcePtr, bool) {
+            called = true;
+            REQUIRE_FALSE(ec);
+            REQUIRE_FALSE(head.absolute_target); // route-table path
+            REQUIRE(head.scheme == "http");
+            REQUIRE(head.authority == "example.com");
+            REQUIRE(head.path == "/hello");
+        });
+
+    REQUIRE(called);
+}
+
 } // namespace
 } // namespace ebpf_quic_proxy

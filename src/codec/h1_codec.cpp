@@ -1,6 +1,7 @@
 #include "h1_codec.h"
 #include <asio.hpp>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <sstream>
 #include <string_view>
@@ -315,6 +316,29 @@ H1Codec::parse_header_block(const std::string& raw, std::string* version_out) {
     if (head.method.empty() || head.path.empty())
         return {{}, "bad request line: " + line};
 
+    // Request-target may be origin-form ("/path") or absolute-form
+    // ("http://host/path" — a forward-proxy request).  Normalize absolute-form
+    // to origin-form here so the backend always receives origin-form; the URL's
+    // scheme/authority are recorded for the relay to direct-connect.
+    auto scheme_pos = head.path.find("://");
+    if (scheme_pos != std::string::npos && scheme_pos > 0) {
+        std::string scheme = head.path.substr(0, scheme_pos);
+        std::string rest = head.path.substr(scheme_pos + 3);
+        auto slash = rest.find('/');
+        std::string authority =
+            (slash == std::string::npos) ? rest : rest.substr(0, slash);
+        std::string path =
+            (slash == std::string::npos) ? "/" : rest.substr(slash);
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        head.scheme = std::move(scheme);
+        head.authority = std::move(authority);
+        head.path = std::move(path);
+        head.absolute_target = true;
+    }
+
     // Headers
     while (std::getline(iss, line)) {
         if (!line.empty() && line.back() == '\r')
@@ -337,6 +361,14 @@ H1Codec::parse_header_block(const std::string& raw, std::string* version_out) {
     // Extract Content-Length.
     if (auto cl = head.headers.get("content-length")) {
         head.content_length = std::strtoul(cl->c_str(), nullptr, 10);
+    }
+
+    // Origin-form request: authority comes from the Host header, scheme is
+    // inferred as http (this transport does not speak TLS).
+    if (!head.absolute_target) {
+        head.scheme = "http";
+        if (auto host = head.headers.get("host"))
+            head.authority = *host;
     }
 
     return {std::move(head), {}};
