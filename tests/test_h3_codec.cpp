@@ -152,6 +152,7 @@ TEST_CASE("request_head_from_headers routes pseudo-headers", "[h3_codec]") {
 
     auto head = h3_detail::request_head_from_headers(raw);
     REQUIRE(head.method == "POST");
+    REQUIRE(head.version == "HTTP/3");
     REQUIRE(head.scheme == "https");
     REQUIRE(head.authority == "api.example.com");
     REQUIRE(head.path == "/submit?q=1");
@@ -184,6 +185,7 @@ TEST_CASE("response_head_from_headers maps :status", "[h3_codec]") {
     auto resp = h3_detail::response_head_from_headers(raw);
     REQUIRE(resp.status_code == 200);
     REQUIRE(resp.reason.empty()); // HTTP/3 has no reason phrase
+    REQUIRE(resp.version == "HTTP/3");
     REQUIRE(resp.headers.get("content-type").value() == "text/plain");
     REQUIRE(resp.content_length.value() == 5u);
 }

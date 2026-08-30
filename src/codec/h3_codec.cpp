@@ -140,6 +140,7 @@ bool parse_request_headers(
 HttpRequestHead request_head_from_headers(
     const ITransportStream::HeaderList& raw) {
     HttpRequestHead head;
+    head.version = "HTTP/3"; // H3 has no version line — it is always 3
     for (const auto& [n, v] : raw) {
         if (n == ":method") {
             head.method = v;
@@ -169,6 +170,7 @@ HttpResponseHead response_head_from_headers(
     const ITransportStream::HeaderList& raw) {
     HttpResponseHead head;
     head.reason = ""; // HTTP/3 has no reason phrase (RFC 9114 §4.1)
+    head.version = "HTTP/3"; // H3 has no version line — it is always 3
     for (const auto& [n, v] : raw) {
         if (n == ":status") {
             char* end = nullptr;

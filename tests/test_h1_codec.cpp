@@ -24,15 +24,20 @@ public:
         cb({}, n);
     }
 
-    void async_write_some(asio::const_buffer, WriteCallback cb) override {
-        cb({}, 0);
+    void async_write_some(asio::const_buffer buf, WriteCallback cb) override {
+        written_.append(static_cast<const char*>(buf.data()), buf.size());
+        cb({}, buf.size());
     }
 
     void async_shutdown(ShutdownCallback cb) override { cb({}); }
     std::string stream_id() const override { return "mock"; }
 
+    /// Everything written so far, in order.
+    const std::string& written() const { return written_; }
+
 private:
     std::string data_;
+    std::string written_;
     std::size_t read_pos_ = 0;
 };
 
@@ -53,6 +58,7 @@ TEST_CASE("H1Codec parses simple GET request", "[h1_codec]") {
             REQUIRE_FALSE(ec);
             REQUIRE(head.method == "GET");
             REQUIRE(head.path == "/hello");
+            REQUIRE(head.version == "HTTP/1.1");
             REQUIRE(head.headers.get("host").value() == "example.com");
             REQUIRE(head.headers.get("accept").value() == "text/html");
             REQUIRE(!head.content_length.has_value());
@@ -224,6 +230,86 @@ TEST_CASE("H1Codec origin-form fills scheme/authority from Host",
         });
 
     REQUIRE(called);
+}
+
+// ── version field ─────────────────────────────────────────
+
+TEST_CASE("H1Codec parses HTTP/1.0 request (version + keep_alive)",
+          "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>(
+        "GET /old HTTP/1.0\r\n"
+        "\r\n");
+
+    H1Codec codec;
+    bool called = false;
+
+    codec.async_parse_request(
+        stream, [&](asio::error_code ec, HttpRequestHead head,
+                    BodySourcePtr, bool keep_alive) {
+            called = true;
+            REQUIRE_FALSE(ec);
+            REQUIRE(head.version == "HTTP/1.0");
+            // HTTP/1.0 without Connection: keep-alive → connection closes.
+            REQUIRE_FALSE(keep_alive);
+        });
+
+    REQUIRE(called);
+}
+
+TEST_CASE("H1Codec parses response version", "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>(
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n");
+
+    H1Codec codec;
+    bool called = false;
+
+    codec.async_parse_response(
+        stream, [&](asio::error_code ec, HttpResponseHead head,
+                    BodySourcePtr, bool) {
+            called = true;
+            REQUIRE_FALSE(ec);
+            REQUIRE(head.status_code == 200);
+            REQUIRE(head.reason == "OK");
+            REQUIRE(head.version == "HTTP/1.0");
+        });
+
+    REQUIRE(called);
+}
+
+TEST_CASE("H1Codec writes request with the IR's version", "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>("");
+
+    HttpRequestHead head;
+    head.method = "GET";
+    head.path = "/old";
+    head.version = "HTTP/1.0";
+    head.headers.set("host", "example.com");
+
+    H1Codec codec;
+    bool called = false;
+    codec.async_write_request(
+        stream, head, nullptr, [&](asio::error_code ec) { called = true; });
+
+    REQUIRE(called);
+    REQUIRE(stream->written().rfind("GET /old HTTP/1.0\r\n", 0) == 0);
+}
+
+TEST_CASE("H1Codec write normalizes unknown version to HTTP/1.1",
+          "[h1_codec]") {
+    auto stream = std::make_shared<MockStream>("");
+
+    HttpRequestHead head;
+    head.method = "GET";
+    head.path = "/";
+    head.version = "HTTP/3"; // cross-protocol → backend gets HTTP/1.1
+    head.headers.set("host", "x");
+
+    H1Codec codec;
+    codec.async_write_request(stream, head, nullptr,
+                              [](asio::error_code) {});
+    REQUIRE(stream->written().rfind("GET / HTTP/1.1\r\n", 0) == 0);
 }
 
 } // namespace

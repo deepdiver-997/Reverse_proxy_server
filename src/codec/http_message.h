@@ -61,6 +61,9 @@ std::string make_error_response(HttpStatus status, std::string body);
 
 struct HttpRequestHead {
     std::string method;
+    /// Wire protocol version as received, e.g. "HTTP/1.1", "HTTP/1.0",
+    /// "HTTP/3".  Writes keep a valid HTTP/1.x version, else normalize.
+    std::string version = "HTTP/1.1";
     /// Request-target, origin-form ("/path?query").  An H1 absolute-form
     /// target ("GET http://host/path") is normalized here at parse time.
     std::string path;
@@ -80,6 +83,8 @@ struct HttpRequestHead {
 struct HttpResponseHead {
     int status_code = 0; // default — a malformed/missing status must not leak garbage
     std::string reason;
+    /// Wire protocol version as received (see HttpRequestHead::version).
+    std::string version = "HTTP/1.1";
     HeaderMap headers;
     std::optional<std::size_t> content_length;
 

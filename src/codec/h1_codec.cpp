@@ -202,6 +202,15 @@ bool compute_keep_alive(const HeaderMap& hdrs, const std::string& version) {
     return ka;
 }
 
+// Version string to write on the wire: preserve a valid HTTP/1.x version
+// (the client's), otherwise normalize to HTTP/1.1.  The relay always
+// re-frames, so it can safely speak the client's version to a backend.
+std::string wire_h1_version(const std::string& v) {
+    if (v.rfind("HTTP/1.", 0) == 0)
+        return v;
+    return "HTTP/1.1";
+}
+
 } // namespace
 
 
@@ -315,6 +324,7 @@ H1Codec::parse_header_block(const std::string& raw, std::string* version_out) {
         *version_out = version;
     if (head.method.empty() || head.path.empty())
         return {{}, "bad request line: " + line};
+    head.version = version; // carry the wire version in the IR
 
     // Request-target may be origin-form ("/path") or absolute-form
     // ("http://host/path" — a forward-proxy request).  Normalize absolute-form
@@ -484,6 +494,7 @@ H1Codec::parse_response_block(const std::string& raw, std::string* version_out) 
         *version_out = version;
     if (head.status_code <= 0)
         return {head, "bad status line: " + line};
+    head.version = version; // carry the wire version in the IR
     std::getline(rl, head.reason);
     // Trim leading space from reason (" OK" → "OK").
     auto start = head.reason.find_first_not_of(" \t");
@@ -519,7 +530,8 @@ void H1Codec::async_write_request(ITransportStreamPtr stream,
                                   HttpRequestHead head, BodySourcePtr body,
                                   WriteCallback cb) {
     std::ostringstream oss;
-    oss << head.method << " " << head.path << " HTTP/1.1\r\n";
+    oss << head.method << " " << head.path << " "
+        << wire_h1_version(head.version) << "\r\n";
     oss << head.headers.to_wire();
     oss << "\r\n";
 
@@ -540,7 +552,8 @@ void H1Codec::async_write_response(ITransportStreamPtr stream,
                                     HttpResponseHead head, BodySourcePtr body,
                                     WriteCallback cb) {
     std::ostringstream oss;
-    oss << "HTTP/1.1 " << head.status_code << " " << head.reason << "\r\n";
+    oss << wire_h1_version(head.version) << " " << head.status_code << " "
+        << head.reason << "\r\n";
     oss << head.headers.to_wire();
     oss << "\r\n";
 

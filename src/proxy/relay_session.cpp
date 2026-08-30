@@ -33,6 +33,7 @@ void RelaySession::request_phase() {
             }
             client_keep_alive_ = keep_alive;
             request_method_ = head.method;
+            client_version_ = head.version; // echo the client's wire version
             // WebSocket / Upgrade: forwarded normally; a 101 response later
             // switches this relay into raw byte-bridge mode.
             request_is_upgrade_ = is_upgrade_request(head);
@@ -309,6 +310,12 @@ void RelaySession::response_phase() {
             // length — no body follows, suppress it to avoid hanging.
             if (request_method_ == "HEAD")
                 resp_body = nullptr;
+
+            // Re-serialize the status line with the CLIENT's version (the
+            // backend's version described the backend connection).  H1 write
+            // preserves it; H3 write ignores it.
+            if (!client_version_.empty())
+                resp.version = client_version_;
 
             // 101 Switching Protocols: the backend accepted an Upgrade (e.g.
             // WebSocket).  Hand off the 101 (which has no body), then switch

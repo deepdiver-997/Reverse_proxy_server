@@ -71,6 +71,10 @@ private:
     std::shared_ptr<HttpRequestHead> pending_head_; // kept for a possible retry
     BodySourcePtr pending_body_;
     std::string request_method_;
+    // Client's wire version — responses are re-serialized with it, so an
+    // HTTP/1.0 client sees "HTTP/1.0" in the status line (H1 write preserves
+    // it; H3 ignores it).
+    std::string client_version_;
     bool client_keep_alive_ = false;
     bool request_is_upgrade_ = false; // client asked for an Upgrade (WebSocket)
     bool done_ = false;
