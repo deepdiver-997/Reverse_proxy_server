@@ -39,17 +39,27 @@ docs/                         架构、传输层、设计决策文档
 
 ## 构建
 
-依赖：CMake ≥ 3.16，Clang，Boost.Asio（头文件，`/opt/homebrew/include`），spdlog，toml11。
+依赖链：**Go → BoringSSL → lsquic → 项目**。vendored lsquic 硬绑 BoringSSL（OpenSSL 不兼容），BoringSSL 需要 Go。完整步骤见 [docs/build.md](docs/build.md)：
 
 ```bash
-# 1) 预构建 lsquic + BoringSSL（第三方目录内，参照其自身构建脚本）
-#    产物需出现在 third_party/lsquic/build/src/liblsquic/liblsquic.a
+# 1) 构建 BoringSSL（需要 Go）
+cmake -S third_party/boringssl -B third_party/boringssl/build -DCMAKE_BUILD_TYPE=Release
+cmake --build third_party/boringssl/build -j
 
-# 2) 配置并构建代理
+# 2) 构建 lsquic（对 BoringSSL）
+cmake -S third_party/lsquic -B third_party/lsquic/build \
+    -DLSQUIC_LIBSSL=BORINGSSL \
+    -DBORINGSSL_INCLUDE=$PWD/third_party/boringssl/include \
+    -DBORINGSSL_LIB_ssl=$PWD/third_party/boringssl/build/libssl.a \
+    -DBORINGSSL_LIB_crypto=$PWD/third_party/boringssl/build/libcrypto.a \
+    -DLSQUIC_BIN=OFF -DLSQUIC_TESTS=OFF
+cmake --build third_party/lsquic/build -j
+
+# 3) 配置并构建代理
 cmake -S . -B build
 cmake --build build -j
 
-# 3) 运行
+# 4) 运行
 ./build/ebpf-quic-proxy proxy.toml
 ```
 
