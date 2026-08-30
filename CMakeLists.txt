@@ -60,9 +60,11 @@ target_link_libraries(ebpf-quic-proxy PRIVATE
 add_executable(proxy_tests
     tests/test_h1_codec.cpp
     tests/test_h3_codec.cpp
+    tests/test_config.cpp
     src/codec/h1_codec.cpp
     src/codec/h3_codec.cpp
     src/codec/http_message.cpp
+    src/config.cpp
 )
 target_include_directories(proxy_tests PRIVATE src /opt/homebrew/include)
 target_link_libraries(proxy_tests PRIVATE

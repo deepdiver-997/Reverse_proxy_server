@@ -8,10 +8,10 @@
 
 - **双协议监听**：同一个 `ProxyCore` 同时挂 TCP 与 QUIC 两个监听器，按传输协议自动选择编解码器。
 - **传输抽象**：`ITransportSession` / `ITransportStream` 屏蔽 TCP/QUIC 差异，`ICodec` 屏蔽 H1/H3 差异。
-- **基于主机的路由** + **后端 keep-alive 连接池**（轮询 + 空闲复用）。
+- **基于主机的路由** + **后端连接池**：H1 后端 keep-alive 复用；H3 后端经 QUIC client 引擎多路复用（一条连接 N 请求流）。
 - **正向代理**：absolute-form 目标（`GET http://host/path`）直连 URL authority；https 走 `CONNECT` 隧道。
 - **字节桥隧道**：CONNECT 与 WebSocket Upgrade（101）切原始字节双向泵，完全绕过 codec。
-- **完整四方 codec**：H1/H3 请求/响应解析与序列化（H3 上游 codec 已就绪，待 QUIC client 引擎）。
+- **完整四方 codec + H3 上游**：H1/H3 请求/响应解析与序列化；`protocol = "h3"` 的后端经 QUIC/HTTP/3 到达。
 - **lsquic + BoringSSL**：内嵌 vendored 依赖，无需系统级 QUIC 栈。
 - 请求/响应转发逻辑与传输解耦，便于后续扩展 gRPC 等。
 
@@ -85,6 +85,14 @@ host = "127.0.0.1"
 port = 9001
 weight = 1
 
+# H3 upstream: reach the backend over QUIC/HTTP/3 (needs an HTTP/3 server
+# there, e.g. another instance of this proxy).
+# [[backends]]
+# id   = "api_h3"
+# host = "127.0.0.1"
+# port = 19000
+# protocol = "h3"
+
 [[routes]]
 host = "api.example.com"
 backend = "api"
@@ -99,6 +107,7 @@ backend = "api"
 | `listen.num_threads` | `1` | io_context 工作线程数。**QUIC 引擎不允许并发驱动**，>1 时需先按连接分片到多个引擎（见 transport 文档） |
 | `listen.quic_port` | `0` | QUIC UDP 端口，`0` 关闭 QUIC |
 | `backends[].id/host/port/weight` | — | 后端端点 |
+| `backends[].protocol` | `"h1"` | 后端协议：`"h1"` = TCP/HTTP/1.1，`"h3"` = QUIC/HTTP/3 上游 |
 | `routes[].host/backend` | — | 路由规则，`host = "*"` 兜底 |
 
 ## 测试

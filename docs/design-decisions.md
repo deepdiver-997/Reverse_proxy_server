@@ -88,7 +88,7 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 - `QuicTransportStream` 新增 `async_take_headers`（`lsquic_stream_get_hset` 认领解码头 → IR）与 `async_send_headers`（`lsquic_stream_send_headers`），`on_readable` 优先投递解码头。
 - `H3Codec::async_parse_request` 走 transport 解码头 → IR，body 为 DATA 读到 FIN；`async_write_response` 走 `send_headers` + body 泵。手写帧解析状态机已移除（varint + `h3_detail::parse_request_headers` 工具保留，仍有单测）。
 - **四方 codec 已补全**：`H3Codec::async_parse_response`/`async_write_request` 已实现（纯 codec 层）。同时 transport 改为返回**原始解码头列表**（含 pseudo-header），请求/响应的 IR 解释收敛到 codec（`request_head_from_headers`/`response_head_from_headers`），`async_parse_response` 因此复用同一套 QPACK 解码机制。H3 写路径统一剥离 hop-by-hop 头（RFC 9113 §8.1.2.2）。
-- **未接**：H3 **上游连接**——真正把请求发到 HTTP/3 后端需要 lsquic **客户端**引擎 + QUIC 后端池，是独立工程。codec 已就绪，接上即用。
+- **H3 上游已接通**：QUIC client 引擎 + 连接复用池见 [ADR-9](#adr-9quic-客户端引擎h3-上游)。
 
 ## 开放问题（需要决策）
 
@@ -99,6 +99,17 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 ### ② 响应路径绕过 codec ✅ 已解决
 
 `RelaySession`（ADR-7）让响应方向走 codec：后端 codec 解析响应 → 客户端 codec 写回。H1 响应（CL/chunked/close-delimited）已实现；H3 响应走 `H3Codec::async_write_response` → `lsquic_stream_send_headers` + DATA body（ADR-8）。
+
+### ADR-9：QUIC 客户端引擎（H3 上游）
+
+**背景**：后端标 `protocol = "h3"` 时要经 QUIC/HTTP/3 到达，需要 lsquic 的 **client 角色**。
+**决策**：第二个独立引擎（`LSENG_HTTP`，无 `LSENG_SERVER`——lsquic 强制一引擎一角色），带独立 UDP socket（临时端口）+ 独立驱动循环，与 server 引擎共享流/会话类与 HSI。`QuicClientEngine` 由 `UpstreamPool` 持有；`BackendEndpoint.protocol` 驱动协议路由。
+**连接复用（多路复用）**：池持有已建立的 client 连接（`quic_conns_`），每请求 `lsquic_conn_make_stream` 开新流，握手完成由 `on_new_stream` 送达（无需 `on_conn_established`，4.7 只有可选的 `on_hsk_done`）。client TLS：自建 SSL_CTX（TLS1.3），`ea_verify_cert` 留 NULL = 跳过验证（curl -k 等价，demo 自签上游）。
+**测试中抓到的三个真 bug**（proxy→proxy 全链路验证才暴露）：
+1. **连接关闭必须清 conn_ctx**：`on_closed()` 里 `lsquic_conn_set_ctx(conn, NULL)`，否则 lsquic 销毁连接时 `assert(cn_conn_ctx == NULL)` abort（server 路径一直潜伏，之前测试连接从不干净关闭）。
+2. **H3 流必须 FIN**：`async_write_request`/`async_write_response` 发送完消息要 `async_shutdown`（FIN）写侧——否则 peer 的 FIN 定界 body 读取器永远等不到 EOF（GET 无 body 尤其致命），且纯头部消息不 flush。
+3. **池重入死锁**：复用连接时 `open_quic_stream` 不得在持 mutex 下调用——`make_stream` 同步触发 `on_new_stream` 重入池再锁同 mutex → `std::mutex` 非递归死锁。
+**边界**：client 不验上游证书；空闲连接无超时回收（靠 on_conn_closed 自清理 + 用前 stream==NULL 检测）；每 endpoint 并发连接无上限。
 
 ### ③ 上游连接复用（keep-alive pool）✅ Step 1 + Step 2 已完成
 
