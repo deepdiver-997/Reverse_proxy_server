@@ -1,84 +1,95 @@
-# Bug report draft: lsquic HTTP/3 server handshake fails with ngtcp2/curl (20-byte client DCID)
+# Bug report draft: lsquic HTTP/3 server handshake fails with ngtcp2/curl
 
-> （可按原样贴到 GitHub issue，或自行精简/翻译。提交前先跑一遍确认没被他人先报。）
+> （issue #680 的初版根因（SCID 不一致 / 20 字节 DCID）经插桩调查被推翻——
+> 那是把 Retry 包的 SCID 误当成 Initial 的。真实原因是下面三条独立的 TLS/QUIC 缺陷。）
 
 ## Title
 
-HTTP/3 server handshake fails with ngtcp2/curl: server's Initial SCID differs from the SCID it registers, so the client's Handshake can't be matched back to the connection
+HTTP/3 server handshake fails with ngtcp2/curl: no-SNI CERT_CB_ERROR, unpadded Initial, and TLS never completing the ClientHello
 
 ## Body
 
 ### Summary
-A stock lsquic **server** engine fails to complete a QUIC handshake with **ngtcp2/curl** clients, while lsquic's own client engine completes it fine. **Verified by building both v4.7.0 and the latest v4.9.4 from source and running the same harness + curl: the bug reproduces identically on both.** Root cause is a Connection-ID consistency bug triggered when the client's Initial packet uses a **20-byte DCID** (= `MAX_CID_LEN`): the server emits an Initial whose SCID field differs from the SCID it registers via `ea_new_scids` / `lsquic_engine_add_cid`, so the client's Handshake (which echoes the wire SCID) can't be matched to the mini-connection and is treated as a brand-new connection.
+A stock lsquic HTTP/3 server (v4.7.0 and v4.9.4, both built from source) fails to
+complete a QUIC handshake with **ngtcp2/curl**, while lsquic's own client completes
+fine. Instrumented investigation (deterministic SCID generator, per-call-site
+markers, `SSL_do_handshake` tracing) shows the failure is **not** a SCID/DCID-length
+issue — that earlier reading was a misattribution. There are three independent
+defects.
 
 ### Environment
-- lsquic 4.7.0 (tag `39718e5`, "Release 4.7.0"). Confirmed identical SCID/CID code in `v4.9.4` (only added `es_max_header_sets`, unrelated).
-- macOS (but platform-agnostic; loopback UDP).
-- Client: Homebrew curl 8.18.0 (ngtcp2 1.19.0, nghttp3 1.14.0), `curl -k --http3-only https://127.0.0.1:8443/`.
-- Server: a reverse proxy built on the lsquic server engine API (`LSENG_SERVER | LSENG_HTTP`, TLS 1.3, ALPN h3, `es_scid_len = 8`).
+- lsquic 4.7.0 and 4.9.4 (built from source, same repro).
+- macOS; loopback UDP.
+- Client: Homebrew curl 8.18.0 (ngtcp2 1.19.0, nghttp3 1.14.0), `curl -k --http3-only`.
+- Server: a minimal standalone harness on the lsquic server engine API
+  (`examples/lsquic_h3_server_min.cpp`, lsquic + BoringSSL only).
 
-### Repro (standalone harness — 30s)
-A minimal standalone lsquic server is included for you to reproduce directly
-(in the open-source reverse-proxy repo, but it does **not** depend on it — only
-lsquic + BoringSSL): `examples/lsquic_h3_server_min.cpp`. Build with
-`cmake --build build --target lsquic_h3_min`, then:
+### 1. No SNI → CERT_CB_ERROR
+Connecting by **IP** (curl to `127.0.0.1` sends no SNI, RFC 6066) makes
+`iquic_lookup_cert()` in `lsquic_enc_sess_ietf.c` return 0 in HTTP/3 mode →
+BoringSSL aborts with `error:1000007e:SSL routines:OPENSSL_internal:CERT_CB_ERROR`.
+Connecting by **hostname** (SNI present) clears this error. lsquic's own client
+always sends SNI even for IPs, which is why lsquic↔lsquic works.
+- Repro: `curl -k --http3-only https://127.0.0.1:PORT/`
 
-```console
-$ ./build/lsquic_h3_min 18455          # from the repo root (reads certs/)
-$ curl -k --http3-only https://127.0.0.1:18455/
+### 2. Ack-eliciting Initial not padded to 1200 bytes (RFC 9000 §14.1)
+The server answers the 1200-byte client Initial with a **~60-byte** Initial. The
+padding in `lsquic_mini_conn_ietf.c` (`ietf_mini_conn_ci_next_packet_to_send`) is
+commented out ("do not pad INIT packet only, instead pad the coalesced later") and
+the deferred "coalesced later" padding never happens, so strict clients (ngtcp2)
+drop the undersized datagram. Forcing the padding makes the Initial 1255 bytes
+(verified).
+- Repro: `curl -k --http3-only https://localhost:PORT/` (isolates this from #1)
+
+### 3. Server TLS never completes the ClientHello
+Even with SNI present and padding forced, the handshake still fails:
+`SSL_do_handshake` returns `WANT_READ` forever after ~143 bytes of ClientHello are
+fed, so the **ServerHello is never generated** and the server only sends ACK-only
+Initials. Likely a BoringSSL QUIC-mode / CRYPTO-feed issue with the
+OpenSSL-generated ClientHello; needs a maintainer to look at the enc-session
+handshake path.
+
+### Harness
+`examples/lsquic_h3_server_min.cpp` — standalone (lsquic + BoringSSL only), in the
+reverse-proxy repo but independent of it. Build `cmake --build build --target
+lsquic_h3_min`, run, then the two curl commands above.
+
+Needs any self-signed cert/key (argv[2]/argv[3]; default `certs/`):
+```
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=127.0.0.1"
+./lsquic_h3_server_min 8443 cert.pem key.pem
 ```
 
-Harness output (this is the entire bug in three lines):
-
-```
-[REG]  ea_new_scids SCID len=8 hex=c5decb585547a885    <-- SCID registered
-[WIRE] outbound Initial SCID len=8 hex=93573d66575c5e03 <-- SCID actually on the wire
-# ...curl exit=7, on_new_conn NEVER fires...
-```
-
-The harness logs `[REG]` (SCID via `ea_new_scids`) and `[WIRE]` (SCID parsed from
-the outbound Initial packet) for each new connection. The client echoes `[WIRE]`
-as its Handshake DCID; the server (and any external CID router) can only find
-`[REG]` — mismatch → mismatch → the Handshake can't be matched to the mini-conn
-and is treated as a brand-new connection.
-
-### Byte-level evidence (from the standalone harness / proxy)
-- `ea_new_scids` reports SCID `c5decb585547a885` (8 bytes).
-- The outbound Initial carries SCID `93573d66575c5e03` (8 bytes) — what the client echoes.
-- These differ → server sends an Initial whose SCID it never registered; the
-  client's Handshake DCID can't be matched by `conns_hash` (nor a demux).
-
-### Symptom details (why it never completes)
-1. Client Initial: DCID = **20 bytes** (ngtcp2). Server registers SCID X, replies Initial with wire SCID Y (Y ≠ X).
-2. Client Handshake: DCID = Y (echoed). Server's `find_or_create_conn()` looks up Y, misses, creates a NEW mini-conn (a second `ea_new_scids`/`get_ssl_ctx` fires), and `on_new_conn` never fires.
-3. Interesting confirmation: that *second* mini-conn's SCID **does** match its wire SCID — the mismatch happens only on the 20-byte-original-DCID connection.
-
-### A control that works (isolates the trigger = 20-byte Initial DCID)
-lsquic's own client engine (uses an **8-byte** Initial DCID) against the same server completes fine (`on_new_conn` fires, request/response flows). So the server is fine for 8-byte client DCIDs and breaks specifically for ngtcp2's 20-byte one.
-
-### Suggested starting points for the fix
-- In the server mini-conn SCID issue path: ensure the SCID carried in the server's Initial packet is the same CID inserted into `conns_hash`/reported via `lsquic_engine_add_cid` (`ea_new_scids`). The 8-byte SCID generation diverges from the registered value specifically when the client's original DCID is 20 bytes.
-- Verify `es_scid_len` vs `MAX_CID_LEN` (20) interaction in Initial packet construction.
-
-### Additional info
-`examples/lsquic_h3_server_min.cpp` is self-contained (lsquic + BoringSSL only) and can be shared/extracted; full packet captures available on request.
+### Notes / fix direction
+- Defects 1 and 2 are clearly fixable: fall back to a default cert when no SNI,
+  and re-enable the Initial padding. Defect 3 needs investigation of the TLS
+  CRYPTO feed.
+- Earlier in this thread the failure was reported as "server Initial SCID ≠
+  registered SCID with a 20-byte client DCID". That was wrong: the [WIRE] value
+  was the **Retry packet's** SCID (SREJ fires when the stalled TLS/TP handshake
+  leaves `IMC_HAVE_TP` unset), and the 20-byte DCID is a red herring (curl happens
+  to use 20-byte DCIDs *and* OpenSSL *and* no-SNI-on-IP, all differing from
+  lsquic's own client).
 
 ---
 
-# Filing instructions (how to create the issue)
+# Filing instructions
 
-## Option A — GitHub web UI (recommended)
-1. Open https://github.com/litespeedtech/lsquic/issues in a logged-in browser.
-2. Click the green **"New issue"** button (top-right).
-3. Paste the title + body above.
-4. Optionally tag `Component: server`, and attach any packet capture.
-5. Click **"Submit new issue"**.
+## Edit the existing issue (recommended, keeps the discussion)
+1. Open https://github.com/litespeedtech/lsquic/issues/680.
+2. Click **"Edit"** (⋯ menu) → change the title to the one above.
+3. Replace the body with the text above.
+4. Update the attached `lsquic_h3_server_min.cpp` (the revised version) if you
+   re-attach it.
 
-## Option B — `gh` CLI (need `gh` installed + `gh auth login`)
+## Or close #680 and open a new one
+1. Close #680 (comment: "superseded by the corrected investigation below; the
+   earlier root cause was a misattribution").
+2. New issue → paste the title + body above → attach the cpp.
+
+## `gh` CLI alternative (if installed + `gh auth login`)
 ```bash
 gh issue create --repo litespeedtech/lsquic \
-  --title "HTTP/3 server handshake fails with ngtcp2/curl: Initial SCID != registered SCID (20-byte client DCID)" \
+  --title "HTTP/3 server handshake fails with ngtcp2/curl: no-SNI CERT_CB_ERROR, unpadded Initial, and TLS never completing the ClientHello" \
   --body-file docs/lsquic-handshake-bug-report.md
 ```
-
-> Note: the sandbox here cannot create the issue for you — it has no GitHub auth and github.com (web/raw) is unreachable from it, only api.github.com. So filing on the web (or your own `gh`) is the way.

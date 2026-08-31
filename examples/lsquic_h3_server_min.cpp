@@ -1,22 +1,30 @@
 // lsquic_h3_server_min — MINIMAL standalone lsquic HTTP/3 server harness.
 //
-// Purpose: reproduce upstream handshake bug "server Initial SCID differs from
-// the SCID lsquic registers when the client's Initial DCID is 20 bytes
-// (= MAX_CID_LEN)."  Only depends on lsquic + OpenSSL/BoringSSL — NOT the
-// proxy project.
+// Purpose: reproduce the handshake failures between an lsquic server and
+// ngtcp2/curl.  Only depends on lsquic + OpenSSL/BoringSSL — NOT the proxy
+// project.
 //
-// It logs, at the byte level, BOTH Connection IDs per new connection:
-//   [REG]  SCID reported via ea_new_scids (the one lsquic inserts into its
-//          conn hash, and an external demux would route by)
-//   [WIRE] SCID in the outbound Initial packet (the one the client echoes as
-//          its Handshake DCID)
+// Three independent defects are visible (verified on lsquic 4.7.0 AND 4.9.4,
+// both built from source):
+//   1. No-SNI → CERT_CB_ERROR.  Connecting by IP (curl to 127.0.0.1 sends no
+//      SNI per RFC 6066) makes iquic_lookup_cert() return 0 in HTTP/3 mode →
+//      BoringSSL aborts with CERT_CB_ERROR.  Connect by hostname to avoid.
+//   2. Ack-eliciting Initial is NOT padded to 1200 bytes (RFC 9000 §14.1): the
+//      server answers the 1200-byte client Initial with a ~60-byte Initial
+//      (the padding in lsquic_mini_conn_ietf.c is commented out).
+//   3. Server TLS never completes the ClientHello: SSL_do_handshake returns
+//      WANT_READ forever, no ServerHello is generated, only ACK-only Initials
+//      are sent.
 //
-// With a 20-byte client DCID (curl/ngtcp2) these differ -> handshake stalls.
-// With an 8-byte client DCID (lsquic's own client) they match -> handshake OK.
+// It logs the SCID lsquic reports via ea_new_scids ([REG]) and the SCID parsed
+// from each outbound long-header packet ([WIRE]).  NOTE: with default settings
+// the server may send a Retry packet (SREJ), whose fresh SCID legitimately
+// differs from [REG] — that is NOT the Initial's SCID.
 //
 // Build:   cmake --build build --target lsquic_h3_min
 // Run:     ./build/lsquic_h3_min [port]      (default 8443, from repo root)
-// Test:    curl -k --http3-only https://127.0.0.1:8443/
+// Test:    curl -k --http3-only https://127.0.0.1:PORT/   (defect 1)
+//          curl -k --http3-only https://localhost:PORT/  (defects 2/3)
 
 #include <lsxpack_header.h>
 #include <lsquic.h>
@@ -112,7 +120,7 @@ static void dump_wire_scid(const unsigned char* p, size_t len) {
     if (pos >= len) return;
     size_t sclen = p[pos];
     if (sclen > 20 || pos + 1 + sclen > len) return;
-    printf("[WIRE] outbound Initial SCID len=%zu hex=%s\n", sclen,
+    printf("[WIRE] outbound long-header SCID len=%zu hex=%s\n", sclen,
            hexstr(p + pos + 1, sclen).c_str());
     fflush(stdout);
 }
