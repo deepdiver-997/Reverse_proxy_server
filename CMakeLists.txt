@@ -65,6 +65,16 @@ add_executable(quic_demux_demo
 target_include_directories(quic_demux_demo PRIVATE ${BORINGSSL_ROOT}/include)
 target_link_libraries(quic_demux_demo PRIVATE lsquic)
 
+# Minimal standalone lsquic HTTP/3 server — repro harness for the upstream
+# handshake bug (server Initial SCID != registered SCID under 20-byte client
+# DCID).  Depends only on lsquic+BoringSSL, not the proxy layers.  See
+# examples/lsquic_h3_server_min.cpp header comment.
+add_executable(lsquic_h3_min
+    examples/lsquic_h3_server_min.cpp
+)
+target_include_directories(lsquic_h3_min PRIVATE ${BORINGSSL_ROOT}/include)
+target_link_libraries(lsquic_h3_min PRIVATE lsquic)
+
 # ── Tests ─────────────────────────────────────────────────
 
 add_executable(proxy_tests

@@ -247,4 +247,6 @@ demux：按 SCID → W（不看 4 元组）→ 连接不断
 
 lsquic 自己的客户端（8 字节 DCID）时线上 SCID 与登记 SCID 一致，故命中。**这是 lsquic 在客户端 DCID 为 MAX_CID_LEN(20) 时 SCID 生成/登记不一致的库 bug**，代理层不可修，需 lsquic 修复/升级（或对本例无法凭代理手段规避）。
 
+最小复现 harness：`examples/lsquic_h3_server_min.cpp`（纯 lsquic+BoringSSL，不依赖代理层）——运行后用 `curl --http3` 即复现，其输出直接打印 `[REG]`（`ea_new_scids` 登记的 SCID）与 `[WIRE]`（线上 Initial 的 SCID）两值不等、`on_new_conn` 永不触发。报 upstream 的草稿：`docs/lsquic-handshake-bug-report.md`。
+
 **顺带修复的真 bug（本 refactor 引入，非此缺陷）**：worker 的 io_context 空转时 `io_context::run()` 立即返回、线程退出，导致 ingress `post` 的投递 handler（TCP fd / QUIC 包）永不执行——`quic_port=0` 且空闲时尤其明显。修复 = `asio::make_work_guard` 让每个 io_context 常驻（见 §3）。
