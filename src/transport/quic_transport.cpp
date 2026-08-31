@@ -462,24 +462,6 @@ namespace {
 
 // ── address helpers ───────────────────────────────────────
 
-void to_sockaddr(const asio::ip::udp::endpoint& ep,
-                 struct sockaddr_storage* sa) {
-    std::memset(sa, 0, sizeof(*sa));
-    if (ep.address().is_v4()) {
-        auto* sin = reinterpret_cast<struct sockaddr_in*>(sa);
-        sin->sin_family = AF_INET;
-        sin->sin_port   = htons(ep.port());
-        auto bytes = ep.address().to_v4().to_bytes();
-        std::memcpy(&sin->sin_addr, bytes.data(), 4);
-    } else {
-        auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(sa);
-        sin6->sin6_family = AF_INET6;
-        sin6->sin6_port   = htons(ep.port());
-        auto bytes = ep.address().to_v6().to_bytes();
-        std::memcpy(&sin6->sin6_addr, bytes.data(), 16);
-    }
-}
-
 std::string conn_peer_addr(lsquic_conn_t* conn) {
     const struct sockaddr *local, *peer;
     lsquic_conn_get_sockaddr(conn, &local, &peer);
@@ -496,45 +478,6 @@ std::string conn_peer_addr(lsquic_conn_t* conn) {
                   buf, sizeof(buf));
     }
     return buf[0] ? buf : "unknown";
-}
-
-// ── UDP send ──────────────────────────────────────────────
-
-/// Send a batch of lsquic out-specs as UDP datagrams on `fd`.  Returns how
-/// many were sent; `*blocked` is set if any hit EAGAIN — lsquic retains the
-/// unsent packets and expects lsquic_engine_send_unsent_packets() once the
-/// socket drains.
-unsigned send_specs(int fd, const lsquic_out_spec* specs, unsigned count,
-                    bool* blocked) {
-    unsigned sent = 0;
-    *blocked = false;
-    for (unsigned i = 0; i < count; ++i) {
-        const auto& spec = specs[i];
-        // sendmsg (scatter-gather): all iovs in this spec go out as a single
-        // UDP datagram, matching lsquic's expectation.
-        struct msghdr hdr = {};
-        hdr.msg_name    = const_cast<struct sockaddr*>(spec.dest_sa);
-        hdr.msg_namelen = spec.dest_sa->sa_family == AF_INET
-                              ? sizeof(struct sockaddr_in)
-                              : sizeof(struct sockaddr_in6);
-        hdr.msg_iov     = const_cast<struct iovec*>(spec.iov);
-        hdr.msg_iovlen  = spec.iovlen;
-        // msg_control, msg_controllen left as 0 — no ancillary data.
-
-        ssize_t n = sendmsg(fd, &hdr, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                spdlog::debug("QUIC sendmsg would block — will retry on writable");
-                *blocked = true;
-            } else {
-                spdlog::debug("QUIC sendmsg failed: {} (errno={})",
-                              strerror(errno), errno);
-            }
-        } else {
-            ++sent;
-        }
-    }
-    return sent;
 }
 
 // ── HTTP/3 header-set interface (HSI, ADR-8) ──────────────
@@ -671,7 +614,7 @@ void hsk_done_cb(lsquic_conn_t* conn, enum lsquic_hsk_status status) {
 // ── per-role stream interfaces ─────────────────────────────
 
 static const struct lsquic_stream_if kServerStreamIf = {
-    .on_new_conn    = QuicTransportListener::on_new_conn_cb,
+    .on_new_conn    = QuicServerEngine::on_new_conn_cb,
     .on_conn_closed = conn_closed_cb,
     .on_new_stream  = new_stream_cb,
     .on_read        = read_cb,
@@ -693,31 +636,17 @@ static const struct lsquic_stream_if kClientStreamIf = {
 };
 
 // ═══════════════════════════════════════════════════════════
-// QuicTransportListener
+// QuicServerEngine
 // ═══════════════════════════════════════════════════════════
 
-QuicTransportListener::QuicTransportListener(asio::io_context& io,
-                                             uint16_t port,
-                                             SslCtxPtr ssl_ctx,
-                                             bool reuse_port)
+QuicServerEngine::QuicServerEngine(asio::io_context& io, SslCtxPtr ssl_ctx,
+                                   QuicPacketDemux* demux)
     : io_(io),
-      socket_(io),
       tick_timer_(io),
-      ssl_ctx_(std::move(ssl_ctx)) {
+      ssl_ctx_(std::move(ssl_ctx)),
+      demux_(demux) {
 
     ensure_quic_global_init();
-
-    // Open unbound, set SO_REUSEPORT BEFORE bind (must precede bind): with
-    // Model B several listeners share the port and the kernel distributes
-    // datagrams by 4-tuple, giving each connection a fixed engine.
-    socket_.open(asio::ip::udp::v4());
-    if (reuse_port) {
-        int on = 1;
-        ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_REUSEPORT, &on,
-                     sizeof(on));
-    }
-    socket_.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
-    raw_fd_ = socket_.native_handle();
 
     struct lsquic_engine_api api = {};
     api.ea_hsi_if          = &kHsiIf;
@@ -729,10 +658,16 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
     api.ea_lookup_cert     = lookup_cert_cb;
     api.ea_cert_lu_ctx     = this;
     api.ea_get_ssl_ctx     = get_ssl_ctx_cb;
+    api.ea_new_scids       = on_new_scids_cb;
+    api.ea_old_scids       = on_old_scids_cb;
+    api.ea_cids_update_ctx = this;
 
-    // Engine settings — use defaults.
+    // Engine settings.  es_scid_len must equal the demux's kServerCidLen:
+    // short-header packets don't carry the DCID length, so the demux assumes
+    // this exact value when parsing inbound datagrams.
     struct lsquic_engine_settings settings;
     lsquic_engine_init_settings(&settings, LSENG_SERVER | LSENG_HTTP);
+    settings.es_scid_len = kServerCidLen;
     api.ea_settings = &settings;
 
     unsigned flags = LSENG_SERVER | LSENG_HTTP;
@@ -740,11 +675,9 @@ QuicTransportListener::QuicTransportListener(asio::io_context& io,
     engine_ = lsquic_engine_new(flags, &api);
     if (!engine_)
         throw std::runtime_error("Failed to create lsquic engine");
-
-    spdlog::info("QUIC listener created on port {}", port);
 }
 
-QuicTransportListener::~QuicTransportListener() {
+QuicServerEngine::~QuicServerEngine() {
     if (engine_) {
         lsquic_engine_destroy(engine_);
         engine_ = nullptr;
@@ -752,69 +685,42 @@ QuicTransportListener::~QuicTransportListener() {
     // ssl_ctx_ is a shared_ptr — released here (last holder frees the SSL_CTX).
 }
 
-void QuicTransportListener::set_new_session_cb(NewSessionCallback cb) {
+void QuicServerEngine::set_new_session_cb(NewSessionCallback cb) {
     new_session_cb_ = std::move(cb);
 }
 
-void QuicTransportListener::start() {
-    do_recv();
+void QuicServerEngine::start() {
     schedule_tick();
 }
 
-// ── UDP receive loop ──────────────────────────────────────
-
-void QuicTransportListener::do_recv() {
-    socket_.async_receive_from(
-        asio::buffer(recv_buf_), recv_endpoint_,
-        [this](asio::error_code ec, std::size_t n) { on_packet(ec, n); });
-}
-
-void QuicTransportListener::on_packet(asio::error_code ec, std::size_t n) {
-    if (ec) {
-        if (ec == asio::error::operation_aborted) {
-            spdlog::debug("QUIC UDP recv stopped (socket closing)");
-            return; // shutdown — do not re-arm
-        }
-        // Transient error (e.g. ENETDOWN).  Re-arm so the listener survives;
-        // otherwise one bad packet kills the whole receive loop.
-        spdlog::warn("QUIC UDP recv error: {} — re-arming", ec.message());
-        if (socket_.is_open())
-            do_recv();
-        return;
-    }
-
-    spdlog::debug("QUIC UDP recv {} bytes from {}", n,
-                  recv_endpoint_.address().to_string());
-
-    struct sockaddr_storage local_sa, peer_sa;
-    to_sockaddr(socket_.local_endpoint(), &local_sa);
-    to_sockaddr(recv_endpoint_, &peer_sa);
-
+void QuicServerEngine::deliver_packet(
+    const unsigned char* buf, std::size_t len,
+    const struct sockaddr_storage& local_sa,
+    const struct sockaddr_storage& peer_sa) {
     int r = lsquic_engine_packet_in(
-        engine_, reinterpret_cast<const unsigned char*>(recv_buf_.data()), n,
+        engine_, buf, len,
         reinterpret_cast<const struct sockaddr*>(&local_sa),
         reinterpret_cast<const struct sockaddr*>(&peer_sa),
-        this, // conn_ctx -> the conn's peer_ctx; get_ssl_ctx_cb reads it back
+        this, // conn's peer_ctx; get_ssl_ctx_cb reads it back
         0     // ecn
     );
-
-    if (r < 0) {
+    if (r < 0)
         spdlog::warn("lsquic_engine_packet_in returned {}", r);
-    }
 
-    // Process connections immediately after receiving a packet.
-    // This flushes outgoing packets (e.g. TLS Handshake) that the
-    // engine needs to send as part of the QUIC handshake.
+    // Flush outgoing packets (e.g. TLS Handshake) and advance the state
+    // machine immediately after feeding a packet.
     lsquic_engine_process_conns(engine_);
     schedule_tick();
+}
 
-    // Continue receiving.
-    do_recv();
+void QuicServerEngine::flush_unsent_packets() {
+    if (engine_)
+        lsquic_engine_send_unsent_packets(engine_);
 }
 
 // ── Tick timer ────────────────────────────────────────────
 
-void QuicTransportListener::schedule_tick() {
+void QuicServerEngine::schedule_tick() {
     int diff = 0;
     unsigned next = lsquic_engine_earliest_adv_tick(engine_, &diff);
     if (diff < 0) {
@@ -829,7 +735,7 @@ void QuicTransportListener::schedule_tick() {
     tick_timer_.async_wait([this](asio::error_code ec) { on_tick(ec); });
 }
 
-void QuicTransportListener::on_tick(asio::error_code ec) {
+void QuicServerEngine::on_tick(asio::error_code ec) {
     if (ec)
         return;
     lsquic_engine_process_conns(engine_);
@@ -839,8 +745,8 @@ void QuicTransportListener::on_tick(asio::error_code ec) {
 // ── lsquic callbacks (server-role) ────────────────────────
 
 lsquic_conn_ctx_t*
-QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
-    auto* listener = static_cast<QuicTransportListener*>(self);
+QuicServerEngine::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
+    auto* engine = static_cast<QuicServerEngine*>(self);
     std::string addr = conn_peer_addr(conn);
 
     spdlog::debug("QUIC on_new_conn from {} (conn={})", addr,
@@ -853,72 +759,74 @@ QuicTransportListener::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     auto* ctx = reinterpret_cast<lsquic_conn_ctx_t*>(session.get());
 
     // Notify ProxyCore (passes a shared_ptr copy — the app may retain it).
-    if (listener->new_session_cb_) {
+    if (engine->new_session_cb_) {
         spdlog::debug("QUIC notifying ProxyCore of new session");
-        listener->new_session_cb_(session);
+        engine->new_session_cb_(session);
     }
 
     return ctx;
 }
 
-int QuicTransportListener::on_packets_out_cb(void* self,
-                                             const lsquic_out_spec* specs,
-                                             unsigned count) {
-    auto* listener = static_cast<QuicTransportListener*>(self);
+int QuicServerEngine::on_packets_out_cb(void* self,
+                                        const lsquic_out_spec* specs,
+                                        unsigned count) {
+    auto* engine = static_cast<QuicServerEngine*>(self);
     spdlog::debug("QUIC packets_out: {} specs", count);
 
+    // Send synchronously on the demux's shared fd — UDP sendto is thread-safe
+    // (single-datagram atomic).  Return the TRUE sent count (ea_packets_out
+    // contract: lsquic forgets packets we claim sent, so never over-report).
     bool blocked = false;
-    unsigned sent = send_specs(listener->raw_fd_, specs, count, &blocked);
+    unsigned sent =
+        send_specs(engine->demux_->native_fd(), specs, count, &blocked);
     if (blocked)
-        listener->arm_send_retry();
-    return static_cast<int>(sent); // tell lsquic how many were actually sent
+        engine->demux_->notify_tx_blocked();
+    return static_cast<int>(sent);
 }
 
-void QuicTransportListener::arm_send_retry() {
-    if (send_retry_armed_ || !socket_.is_open())
-        return;
-    send_retry_armed_ = true;
-    socket_.async_wait(
-        asio::ip::udp::socket::wait_write,
-        [this](asio::error_code ec) {
-            send_retry_armed_ = false;
-            if (ec)
-                return;
-            // Socket drained — flush whatever lsquic has queued up.
-            if (engine_)
-                lsquic_engine_send_unsent_packets(engine_);
-            // If the flush itself hit EAGAIN again, re-arm for the next
-            // writable edge.
-            if (engine_ && lsquic_engine_has_unsent_packets(engine_))
-                arm_send_retry();
-        });
+void QuicServerEngine::on_new_scids_cb(void* ctx, void** /*peer_ctx*/,
+                                       const lsquic_cid_t* cids,
+                                       unsigned n_cids) {
+    // ctx is the engine (ea_cids_update_ctx) — the SCIDs belong to this
+    // worker's connections, so inbound packets carrying them must route here.
+    auto* engine = static_cast<QuicServerEngine*>(ctx);
+    for (unsigned i = 0; i < n_cids; ++i)
+        engine->demux_->register_cid(cid_key(&cids[i]), engine->worker_idx_);
+}
+
+void QuicServerEngine::on_old_scids_cb(void* ctx, void** /*peer_ctx*/,
+                                       const lsquic_cid_t* cids,
+                                       unsigned n_cids) {
+    auto* engine = static_cast<QuicServerEngine*>(ctx);
+    for (unsigned i = 0; i < n_cids; ++i)
+        engine->demux_->remove_cid(cid_key(&cids[i]));
 }
 
 // ── TLS lookups (server role) ─────────────────────────────
 // The SSL_CTX is created ONCE by make_server_ssl_ctx and injected; these
-// callbacks only hand it to lsquic.  lookup_cert_cb reaches the listener via
+// callbacks only hand it to lsquic.  lookup_cert_cb reaches the engine via
 // `self` (ea_cert_lu_ctx); get_ssl_ctx_cb has no self pointer, so it reaches
-// the listener through the connection's peer_ctx — we pass `this` as the
-// conn_ctx to lsquic_engine_packet_in (see on_packet).
+// the engine through the connection's peer_ctx — we pass `this` as the
+// conn's peer_ctx to lsquic_engine_packet_in (see deliver_packet).
 
 struct ssl_ctx_st*
-QuicTransportListener::lookup_cert_cb(void* self,
-                                       const struct sockaddr* /*local*/,
-                                       const char* sni) {
-    auto* listener = static_cast<QuicTransportListener*>(self);
+QuicServerEngine::lookup_cert_cb(void* self,
+                                 const struct sockaddr* /*local*/,
+                                 const char* sni) {
+    auto* engine = static_cast<QuicServerEngine*>(self);
     spdlog::debug("QUIC lookup_cert_cb sni={} ssl_ctx={}",
                   sni ? sni : "(null)",
-                  static_cast<void*>(listener->ssl_ctx_.get()));
-    return listener->ssl_ctx_.get();
+                  static_cast<void*>(engine->ssl_ctx_.get()));
+    return engine->ssl_ctx_.get();
 }
 
 struct ssl_ctx_st*
-QuicTransportListener::get_ssl_ctx_cb(void* peer_ctx,
-                                       const struct sockaddr* /*local*/) {
-    auto* listener = static_cast<QuicTransportListener*>(peer_ctx);
+QuicServerEngine::get_ssl_ctx_cb(void* peer_ctx,
+                                 const struct sockaddr* /*local*/) {
+    auto* engine = static_cast<QuicServerEngine*>(peer_ctx);
     spdlog::debug("QUIC get_ssl_ctx_cb ssl_ctx={}",
-                  static_cast<void*>(listener->ssl_ctx_.get()));
-    return listener->ssl_ctx_.get();
+                  static_cast<void*>(engine->ssl_ctx_.get()));
+    return engine->ssl_ctx_.get();
 }
 
 // ═══════════════════════════════════════════════════════════

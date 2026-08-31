@@ -36,6 +36,7 @@ add_executable(ebpf-quic-proxy
     src/config.cpp
     src/transport/tcp_transport.cpp
     src/transport/quic_transport.cpp
+    src/transport/quic_demux.cpp
     src/codec/http_message.cpp
     src/codec/h1_codec.cpp
     src/codec/h3_codec.cpp

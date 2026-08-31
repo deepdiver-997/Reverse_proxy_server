@@ -8,64 +8,47 @@
 namespace ebpf_quic_proxy {
 
 
-ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg,
-                     bool reuse_port)
+ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     : io_(io),
       h1_codec_(std::make_unique<H1Codec>()),
       h3_codec_(std::make_unique<H3Codec>()),
       upstream_pool_(io, make_client_ssl_ctx()) {
 
-    // Build TCP listener.
-    auto ep = asio::ip::tcp::endpoint(
-        asio::ip::make_address(cfg.listen_addr), cfg.listen_port);
-    tcp_listener_ =
-        std::make_shared<TcpTransportListener>(io, ep, reuse_port);
-
     // Build router.
     for (const auto& r : cfg.routes)
         router_.add_rule(r.host_match, r.backend_id);
 
-    // Build upstream pool.
+    // Build upstream pool (per-worker: keep-alive pool + its own QUIC client
+    // engine, lazily created when the first h3 backend is added).
     for (const auto& be : cfg.backends)
         upstream_pool_.add_backend(be);
 
-    spdlog::info("proxy listening on {}:{}", cfg.listen_addr, cfg.listen_port);
+    spdlog::info("proxy worker ready");
     spdlog::info("  routes: {}", cfg.routes.size());
     spdlog::info("  backends: {}", cfg.backends.size());
 }
 
-void ProxyCore::start_tcp() { do_accept(); }
+void ProxyCore::on_new_tcp_socket(asio::ip::tcp::socket socket) {
+    auto session = std::make_shared<TcpTransportSession>(std::move(socket));
+    spdlog::debug("new session from {}", session->remote_addr());
+    on_session(std::move(session));
+}
 
-void ProxyCore::start_quic(uint16_t port, const std::string& cert_file,
-                            const std::string& key_file, bool reuse_port) {
-    // Server TLS ctx: created ONCE here (single-threaded startup) and injected
-    // — immutable after setup, safe to share read-only across listener threads.
-    auto ssl_ctx = make_server_ssl_ctx(cert_file, key_file);
-    quic_listener_ = std::make_unique<QuicTransportListener>(
-        io_, port, std::move(ssl_ctx), reuse_port);
+void ProxyCore::start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx) {
+    quic_engine_ =
+        std::make_unique<QuicServerEngine>(io_, std::move(ssl_ctx), demux);
 
-    quic_listener_->set_new_session_cb(
+    int worker_idx = demux->add_worker(io_, quic_engine_.get());
+    quic_engine_->set_worker_idx(worker_idx);
+
+    quic_engine_->set_new_session_cb(
         [this](QuicTransportSessionPtr session) {
             spdlog::debug("new QUIC session from {}", session->remote_addr());
             on_session(std::move(session));
         });
 
-    quic_listener_->start();
-    spdlog::info("QUIC listener started on port {}", port);
-}
-
-void ProxyCore::do_accept() {
-    tcp_listener_->async_accept(
-        [this](ITransportSessionPtr session) {
-            if (!session) {
-                spdlog::error("accept failed, stopping");
-                return;
-            }
-            spdlog::debug("new session from {}", session->remote_addr());
-            on_session(std::move(session));
-            // Accept the next connection.
-            do_accept();
-        });
+    quic_engine_->start();
+    spdlog::info("QUIC server engine started (worker {})", worker_idx);
 }
 
 void ProxyCore::on_session(ITransportSessionPtr session) {

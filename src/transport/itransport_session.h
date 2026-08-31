@@ -43,18 +43,4 @@ public:
 
 using ITransportSessionPtr = std::shared_ptr<ITransportSession>;
 
-/// Accepts incoming transport sessions.
-class ITransportListener {
-public:
-    using AcceptCallback =
-        std::function<void(ITransportSessionPtr)>;
-
-    virtual ~ITransportListener() = default;
-
-    /// Async accept — cb fires when a new session is established.
-    virtual void async_accept(AcceptCallback cb) = 0;
-};
-
-using ITransportListenerPtr = std::shared_ptr<ITransportListener>;
-
 } // namespace ebpf_quic_proxy

@@ -1,6 +1,5 @@
 #include "tcp_transport.h"
 #include <sstream>
-#include <sys/socket.h>
 
 namespace ebpf_quic_proxy {
 
@@ -69,40 +68,5 @@ void TcpTransportSession::close() {
 }
 
 std::string TcpTransportSession::remote_addr() const { return remote_addr_; }
-
-// ── TcpTransportListener ──────────────────────────────────
-
-TcpTransportListener::TcpTransportListener(
-    asio::io_context& io,
-    const asio::ip::tcp::endpoint& ep,
-    bool reuse_port)
-    : acceptor_(io) {
-    // Open unbound, set options BEFORE bind (SO_REUSEPORT must be set first).
-    acceptor_.open(ep.protocol());
-    int on = 1;
-    ::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_REUSEADDR, &on,
-                 sizeof(on));
-    if (reuse_port)
-        ::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_REUSEPORT, &on,
-                     sizeof(on));
-    acceptor_.bind(ep);
-    acceptor_.listen();
-}
-
-void TcpTransportListener::async_accept(AcceptCallback cb) {
-    auto self = shared_from_this();
-    acceptor_.async_accept(
-        [self, cb = std::move(cb)](asio::error_code ec,
-                                    asio::ip::tcp::socket socket) {
-            if (ec) {
-                // Pass nullptr to signal error — caller decides to retry or die.
-                cb(nullptr);
-                return;
-            }
-            auto session =
-                std::make_shared<TcpTransportSession>(std::move(socket));
-            cb(session);
-        });
-}
 
 } // namespace ebpf_quic_proxy

@@ -3,6 +3,7 @@
 #include "config.h"
 #include "itransport_stream.h"
 #include "itransport_session.h"
+#include "quic_demux.h"
 extern "C" {
 #include <lsquic.h>
 }
@@ -201,42 +202,56 @@ private:
 
 using QuicTransportSessionPtr = std::shared_ptr<QuicTransportSession>;
 
-// ── QuicTransportListener ─────────────────────────────────
+// ── QuicServerEngine ───────────────────────────────────────
 
-/// Manages a UDP socket + lsquic engine.
-/// Does NOT inherit ITransportListener — QUIC connections arrive as callbacks,
-/// not via accept().
-class QuicTransportListener {
+/// Server-role QUIC engine for ONE worker.  This is a pure engine: it owns NO
+/// UDP socket and runs NO recv loop — the demux posts packets to it via
+/// deliver_packet() on this worker's io_context thread.  It owns the lsquic
+/// server engine, the shared server TLS context, and the tick timer; outgoing
+/// packets are sent synchronously on the demux's shared fd.
+class QuicServerEngine {
 public:
     using NewSessionCallback =
         std::function<void(QuicTransportSessionPtr)>;
 
-    /// Create a QUIC listener bound to `port`, using the injected server TLS
-    /// context (created once by make_server_ssl_ctx — externally held, so no
-    /// per-instance cert loading and no shared static).  `reuse_port` (Model B)
-    /// sets SO_REUSEPORT before bind so several listeners share the port and
-    /// the kernel distributes datagrams by 4-tuple (connection affinity).
-    QuicTransportListener(asio::io_context& io, uint16_t port, SslCtxPtr ssl_ctx,
-                          bool reuse_port = false);
-    ~QuicTransportListener();
+    /// `demux` is the shared QUIC ingress: we send on its fd, and register /
+    /// unregister our server SCIDs with it so inbound packets route here.
+    QuicServerEngine(asio::io_context& io, SslCtxPtr ssl_ctx,
+                     QuicPacketDemux* demux);
+    ~QuicServerEngine();
+
+    QuicServerEngine(const QuicServerEngine&) = delete;
+    QuicServerEngine& operator=(const QuicServerEngine&) = delete;
 
     /// Register callback for new QUIC sessions.
     void set_new_session_cb(NewSessionCallback cb);
 
-    /// Begin listening (start UDP recv + timer loop).
+    /// Begin ticking.  Inbound delivery starts once the demux routes to us.
     void start();
 
-    // Referenced by the file-scope kServerStreamIf (quic_transport.cpp), so it
-    // must be public.
+    /// Worker index assigned by the demux (add_worker).  The SCID callbacks use
+    /// it to tell the demux which worker owns a given server SCID.
+    void set_worker_idx(int idx) { worker_idx_ = idx; }
+
+    /// Called by the demux (via io_context::post) with one inbound datagram.
+    /// Runs on this worker's thread.
+    void deliver_packet(const unsigned char* buf, std::size_t len,
+                        const struct sockaddr_storage& local_sa,
+                        const struct sockaddr_storage& peer_sa);
+
+    /// Called by the demux (via post) once the shared socket is writable.
+    void flush_unsent_packets();
+
+    // Referenced by the file-scope kServerStreamIf (quic_transport.cpp).
     static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
 
 private:
     asio::io_context& io_;
-    asio::ip::udp::socket socket_;
     asio::steady_timer tick_timer_;
-    int raw_fd_ = -1; // native fd for synchronous sendto
     lsquic_engine_t* engine_ = nullptr;
     NewSessionCallback new_session_cb_;
+    QuicPacketDemux* demux_ = nullptr;
+    int worker_idx_ = -1;
 
     // TLS context — externally created (make_server_ssl_ctx) and injected;
     // immutable after setup, shared read-only across threads.  Callbacks reach
@@ -248,25 +263,17 @@ private:
     static struct ssl_ctx_st* get_ssl_ctx_cb(void* peer_ctx,
                                               const struct sockaddr* local);
 
-    // Receiving.
-    std::array<char, 65536> recv_buf_{};
-    asio::ip::udp::endpoint recv_endpoint_;
-
-    void do_recv();
-    void on_packet(asio::error_code ec, std::size_t n);
     void schedule_tick();
     void on_tick(asio::error_code ec);
 
-    // Sending: when on_packets_out hits EAGAIN, arm a writability watch and
-    // flush lsquic's unsent packets once the socket drains.
-    void arm_send_retry();
-    bool send_retry_armed_ = false;
-
-    // ── lsquic callbacks (packet sending is per-engine; stream/conn callbacks
-    // are shared free functions in quic_transport.cpp) ──
-    static int on_packets_out_cb(void* self,
-                                 const lsquic_out_spec* specs,
+    // ── lsquic callbacks (stream/conn callbacks are shared free functions in
+    // quic_transport.cpp) ──
+    static int on_packets_out_cb(void* self, const lsquic_out_spec* specs,
                                  unsigned count);
+    static void on_new_scids_cb(void* ctx, void** peer_ctx,
+                                const lsquic_cid_t* cids, unsigned n_cids);
+    static void on_old_scids_cb(void* ctx, void** peer_ctx,
+                                const lsquic_cid_t* cids, unsigned n_cids);
 
     // ── HTTP/3 header-set interface (HSI, ADR-8) ──────────
     // (Implemented as shared free functions in quic_transport.cpp — both the

@@ -13,28 +13,30 @@
 
 namespace ebpf_quic_proxy {
 
+/// One worker: a single io_context thread hosting the relay (business), its
+/// frontend TCP sockets (handed over by the ingress thread), its QUIC server
+/// engine (fed by the demux), and its private backend pool (keep-alive + its
+/// own QUIC client engine).  Everything about a request — frontend, backend,
+/// relay — runs on this one thread (co-located, zero cross-thread marshaling).
 class ProxyCore {
 public:
-    /// `reuse_port` (Model B): listeners set SO_REUSEPORT so several ProxyCore
-    /// units can share the same ports; the kernel distributes connections.
-    ProxyCore(asio::io_context& io, const ProxyConfig& cfg,
-              bool reuse_port = false);
+    ProxyCore(asio::io_context& io, const ProxyConfig& cfg);
 
-    /// Start TCP listener.  Does not block — runs on the io_context.
-    void start_tcp();
+    /// Accept a TCP connection handed over by the ingress thread.  Runs on
+    /// this worker's thread (posted here by the ingress).
+    void on_new_tcp_socket(asio::ip::tcp::socket socket);
 
-    /// Start QUIC listener.  Requires TLS cert/key.
-    void start_quic(uint16_t port, const std::string& cert_file,
-                    const std::string& key_file, bool reuse_port = false);
+    /// Create the QUIC server engine (no socket — it is fed by the demux) and
+    /// register this worker with the demux.  `ssl_ctx` is the shared server
+    /// TLS context, created once in main.
+    void start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx);
 
 private:
-    void do_accept();
     void on_session(ITransportSessionPtr session);
     void on_stream(ITransportStreamPtr stream, ICodec* codec);
 
     asio::io_context& io_;
-    ITransportListenerPtr tcp_listener_;
-    std::unique_ptr<QuicTransportListener> quic_listener_;
+    std::unique_ptr<QuicServerEngine> quic_engine_;
     std::unique_ptr<ICodec> h1_codec_;
     std::unique_ptr<ICodec> h3_codec_;
     Router router_;

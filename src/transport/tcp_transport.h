@@ -45,21 +45,4 @@ private:
     std::string remote_addr_;
 };
 
-/// TCP-backed ITransportListener — wraps asio::ip::tcp::acceptor.
-class TcpTransportListener final
-    : public ITransportListener,
-      public std::enable_shared_from_this<TcpTransportListener> {
-public:
-    /// `reuse_port` (Model B): sets SO_REUSEPORT before bind so several
-    /// acceptors share the port and the kernel distributes new connections.
-    TcpTransportListener(asio::io_context& io,
-                         const asio::ip::tcp::endpoint& ep,
-                         bool reuse_port = false);
-
-    void async_accept(AcceptCallback cb) override;
-
-private:
-    asio::ip::tcp::acceptor acceptor_;
-};
-
 } // namespace ebpf_quic_proxy
