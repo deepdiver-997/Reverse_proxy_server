@@ -19,7 +19,7 @@ defects.
 
 ### Update (verified fix — defects 1 & 2 only, defect 3 was a symptom)
 Both defects are fixed by a two-hunk patch
-(`third_party/patches/lsquic-4.7.0-http3-interop-a-b.patch`):
+(`docs/lsquic-4.7.0-http3-interop-a-b.patch`):
 1. `iquic_lookup_cert`: fall back to the default cert when no SNI (don't return 0).
 2. Re-enable the RFC 9000 §14.1 Initial padding in `lsquic_mini_conn_ietf.c`.
 

@@ -1,0 +1,62 @@
+diff --git a/src/liblsquic/lsquic_enc_sess_ietf.c b/src/liblsquic/lsquic_enc_sess_ietf.c
+index 9339dc3..612e10c 100644
+--- a/src/liblsquic/lsquic_enc_sess_ietf.c
++++ b/src/liblsquic/lsquic_enc_sess_ietf.c
+@@ -1331,14 +1331,11 @@ iquic_lookup_cert (SSL *ssl, void *arg)
+ #endif
+     if (!server_name)
+     {
+-        if (enc_sess->esi_enpub->enp_flags & ENPUB_HTTP)
+-        {
+-            LSQ_DEBUG("SNI is not set, but is required in HTTP/3: "
+-                                                "fail certificate lookup");
+-            return 0;
+-        }
+-        else
+-            LSQ_DEBUG("cert lookup: server name is not set");
++        /* PATCH(A): fall back to the default cert instead of failing the
++           handshake — clients connecting by IP (curl to 127.0.0.1) send no
++           SNI.  enp_lookup_cert below is called with NULL server_name and
++           returns the default context. */
++        LSQ_DEBUG("cert lookup: server name is not set (using default cert)");
+     }
+ 
+     path = enc_sess->esi_conn->cn_if->ci_get_path(enc_sess->esi_conn, NULL);
+diff --git a/src/liblsquic/lsquic_mini_conn_ietf.c b/src/liblsquic/lsquic_mini_conn_ietf.c
+index 9719516..53a056c 100644
+--- a/src/liblsquic/lsquic_mini_conn_ietf.c
++++ b/src/liblsquic/lsquic_mini_conn_ietf.c
+@@ -944,19 +944,20 @@ ietf_mini_conn_ci_next_packet_to_send (struct lsquic_conn *lconn,
+                           "enough quota", packet_out->po_packno);
+                 return NULL;
+             }
+-            // NOTE: do not padd INIT packet only, here, instead pad the coalesced
+-            //       later, can save one packet, more efficient.
+-            // if (!(packet_out->po_frame_types & (1 << QUIC_FRAME_PADDING))
+-            //     && (packet_out->po_frame_types & IQUIC_FRAME_ACKABLE_MASK)
+-            //     && IQUIC_MIN_INIT_PACKET_SZ > packet_out->po_data_sz)
+-            // {
+-            //     size_t pad_size;
+-            //
+-            //     pad_size = IQUIC_MIN_INIT_PACKET_SZ - packet_out->po_data_sz;
+-            //     LSQ_DEBUG("generated PADDING frame: %zd bytes for packet %"PRIu64,
+-            //             pad_size, packet_out->po_packno);
+-            //     imico_zero_pad(packet_out, pad_size);
+-            // }
++            // PATCH(B): re-enable the RFC 9000 14.1 Initial padding.  The
++            // "pad the coalesced later" deferral never actually padded the
++            // datagram, so strict clients (ngtcp2) dropped the ~60-byte Initial.
++            if (!(packet_out->po_frame_types & (1 << QUIC_FRAME_PADDING))
++                && (packet_out->po_frame_types & IQUIC_FRAME_ACKABLE_MASK)
++                && IQUIC_MIN_INIT_PACKET_SZ > packet_out->po_data_sz)
++            {
++                size_t pad_size;
++
++                pad_size = IQUIC_MIN_INIT_PACKET_SZ - packet_out->po_data_sz;
++                LSQ_DEBUG("generated PADDING frame: %zd bytes for packet %"PRIu64,
++                        pad_size, packet_out->po_packno);
++                imico_zero_pad(packet_out, pad_size);
++            }
+         }
+         packet_size = lsquic_packet_out_total_sz(lconn, packet_out);
+         if (!(to_coal
