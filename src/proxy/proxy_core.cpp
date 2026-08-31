@@ -94,6 +94,16 @@ void ProxyCore::graceful_shutdown() {
             }
         }
         spdlog::debug("graceful_shutdown: {} live relay(s) closed", live);
+        // QUIC: GOAWAY every live server connection (H3 graceful shutdown).
+        if (quic_engine_)
+            quic_engine_->graceful_shutdown();
+    });
+}
+
+void ProxyCore::force_close_quic() {
+    asio::post(io_, [this] {
+        if (quic_engine_)
+            quic_engine_->force_close_all(); // CONNECTION_CLOSE, flushed now
     });
 }
 

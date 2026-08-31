@@ -12,6 +12,7 @@ extern "C" {
 #include <functional>
 #include <memory>
 #include <queue>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -159,6 +160,10 @@ public:
     void close() override;
     std::string remote_addr() const override;
 
+    /// The underlying lsquic connection — used by the server engine for
+    /// graceful shutdown (GOAWAY / CONNECTION_CLOSE).
+    lsquic_conn_t* conn() const { return conn_; }
+
     // Called by the glue layer.
     void on_new_stream(lsquic_stream_t* lsquic_stream);
     void on_closed();
@@ -242,6 +247,17 @@ public:
     /// Called by the demux (via post) once the shared socket is writable.
     void flush_unsent_packets();
 
+    /// Graceful QUIC shutdown (server stopping): send GOAWAY on every live
+    /// connection — clients stop issuing new requests, in-flight H3 streams
+    /// keep running.  Flushes the GOAWAY frames synchronously.  MUST run on
+    /// this engine's worker thread (call from ProxyCore's posted lambda).
+    void graceful_shutdown();
+
+    /// Final step: force CONNECTION_CLOSE on every remaining live connection
+    /// and flush synchronously so the frames actually leave before the worker
+    /// io_context stops.  MUST run on this engine's worker thread.
+    void force_close_all();
+
     // Referenced by the file-scope kServerStreamIf (quic_transport.cpp).
     static lsquic_conn_ctx_t* on_new_conn_cb(void* self, lsquic_conn_t* conn);
 
@@ -262,6 +278,14 @@ private:
                                               const char* sni);
     static struct ssl_ctx_st* get_ssl_ctx_cb(void* peer_ctx,
                                               const struct sockaddr* local);
+
+    /// Live server sessions, tracked for graceful shutdown.  Weak — a session
+    /// removes itself by dying; the on_conn_closed → closed_cb erases the entry
+    /// (and graceful_shutdown/force_close_all prune expired ones).  Only ever
+    /// touched on this worker's thread.
+    std::set<std::weak_ptr<QuicTransportSession>,
+             std::owner_less<std::weak_ptr<QuicTransportSession>>>
+        live_sessions_;
 
     void schedule_tick();
     void on_tick(asio::error_code ec);

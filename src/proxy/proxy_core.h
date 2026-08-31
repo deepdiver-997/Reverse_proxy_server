@@ -35,11 +35,17 @@ public:
     void start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx);
 
     /// Graceful shutdown (server stopping): FIN + drain every live frontend
-    /// connection on this worker.  Posts to this worker's io_context — callable
-    /// from any thread.  Idle keep-alive clients get FIN now (their pending read
-    /// sees the peer's EOF and tears down cleanly); in-flight exchanges finish,
-    /// then close gracefully instead of looping for the next request.
+    /// connection on this worker, and GOAWAY every live QUIC server connection.
+    /// Posts to this worker's io_context — callable from any thread.  Idle
+    /// keep-alive clients get FIN now (their pending read sees the peer's EOF
+    /// and tears down cleanly); in-flight exchanges finish, then close
+    /// gracefully instead of looping for the next request.
     void graceful_shutdown();
+
+    /// Final step (after the grace period): force CONNECTION_CLOSE on every
+    /// remaining QUIC server connection and flush the frames now.  Posts to
+    /// this worker's io_context.
+    void force_close_quic();
 
 private:
     void on_session(ITransportSessionPtr session);

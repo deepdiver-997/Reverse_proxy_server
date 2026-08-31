@@ -149,13 +149,26 @@ void ReverseProxyServer::begin_shutdown() {
     for (auto& core : cores_)
         core->graceful_shutdown();      // FIN + drain frontend TCP (per-worker)
 
-    // In-flight requests get `grace` to finish, then everything hard-stops.
+    // In-flight requests get `grace` to finish (GOAWAY already told QUIC
+    // clients to stop issuing new ones), then finalize: force CONNECTION_CLOSE
+    // on any remaining QUIC connections and hard-stop.
     grace_timer_->expires_after(grace);
+    grace_timer_->async_wait([this](asio::error_code) { finalize(); });
+}
+
+void ReverseProxyServer::finalize() {
+    spdlog::info("grace period over — sending final QUIC CONNECTION_CLOSE");
+    for (auto& core : cores_)
+        core->force_close_quic(); // posts to each worker; flushes the frames
+
+    // One short beat so the workers actually run the close + flush before the
+    // io_contexts stop (a posted handler never runs once stopped).
+    grace_timer_->expires_after(std::chrono::milliseconds(200));
     grace_timer_->async_wait([this](asio::error_code) { hard_stop(); });
 }
 
 void ReverseProxyServer::hard_stop() {
-    spdlog::info("grace period over — stopping all io_contexts");
+    spdlog::info("stopping all io_contexts");
     ingress_io_->stop();
     for (auto& io : worker_ios_)
         io->stop();

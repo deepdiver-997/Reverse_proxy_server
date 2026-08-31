@@ -59,6 +59,7 @@ public:
 private:
     void accept_loop();
     void begin_shutdown();   // runs on the ingress thread (posted from stop())
+    void finalize();         // after grace: force QUIC CONNECTION_CLOSE + beat
     void hard_stop();        // stop every io_context — ends the run() loops
 
     ProxyConfig cfg_;

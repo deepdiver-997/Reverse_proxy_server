@@ -21,7 +21,7 @@ worker i：    前端 socket + QUIC 引擎 + relay + 私有后端池（一条线
 
 - **TCP/QUIC 统一工作模型**：`ITransportSession` / `ITransportStream` 屏蔽传输差异，`ICodec` 屏蔽 H1/H3 差异。
 - **QUIC 共享 UDP 入口**：`QuicPacketDemux` 用 `lsquic_dcid_from_packet` 解析 DCID 并路由到 worker 的 `QuicServerEngine`；发送走 `ea_packets_out` 同步契约。
-- **优雅关闭**：`ReverseProxyServer` 编排 N+1 线程生命周期；`run()` 阻塞并装 SIGINT/SIGTERM。停服时先停止接入（cancel acceptor + demux），对空闲 keep-alive TCP 连接立即 `shutdown_send`，在途请求给 `grace` 时间完成后再 FIN + drain 到 EOF（`close()` 不触发 RST），最后硬停所有 io_context。
+- **优雅关闭**：`ReverseProxyServer` 编排 N+1 线程生命周期；`run()` 阻塞并装 SIGINT/SIGTERM。停服时先停止接入（cancel acceptor + demux）——TCP 侧空闲 keep-alive 连接立即 `shutdown_send`（FIN）、在途请求给 `grace` 时间完成后 FIN + drain 到 EOF（`close()` 不触发 RST）；QUIC 侧先发 **GOAWAY**（在途 H3 流继续），grace 后对剩余连接发 **CONNECTION_CLOSE** 再硬停。
 - **基于主机的路由** + **私有后端池**：H1 后端 keep-alive 复用；H3 后端经 QUIC client 引擎多路复用（一条连接 N 请求流）。
 - **正向代理**：absolute-form 目标（`GET http://host/path`）直连 URL authority；https 走 `CONNECT` 隧道。
 - **字节桥隧道**：CONNECT 与 WebSocket Upgrade（101）切原始字节双向泵，完全绕过 codec。

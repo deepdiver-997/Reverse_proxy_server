@@ -231,8 +231,11 @@ acceptor_.async_accept([this](asio::error_code ec, asio::ip::tcp::socket peer) {
 - `start()`：建 ingress/worker io_context + work guard、demux、共享 server TLS ctx、N 个 ProxyCore、TCP acceptor，起 N+1 线程。acceptor 与 demux 全挂在 ingress 上，与 §3 一致。
 - `stop()`（线程安全）→ 在 ingress 线程上执行：
   1. `acceptor_.cancel()` + `demux_->stop()`（cancel UDP recv，`on_packet` 遇 `operation_aborted` 不复位）——**不再接新连接**。
-  2. 每 worker `ProxyCore::graceful_shutdown()`（post 到该 worker）：遍历 `live_relays_`（弱引用表），对空闲 keep-alive 客户端 `shutdown_send`（FIN，pending read 会看到对端 EOF → teardown）；在途请求置 `draining_`，响应完成后 FIN + drain 到 EOF 再 close（`close()` 无未读数据 → 不触发 RST）。UDP/QUIC 无 FIN 语义，靠 `grace` 硬停兜底。
-  3. `grace`（默认 5s）后 `hard_stop()`：停所有 io_context → 线程 join → 进程退出。
+  2. 每 worker `ProxyCore::graceful_shutdown()`（post 到该 worker）：
+     - **TCP**：遍历 `live_relays_`（弱引用表），对空闲 keep-alive 客户端 `shutdown_send`（FIN，pending read 会看到对端 EOF → teardown）；在途请求置 `draining_`，响应完成后 FIN + drain 到 EOF 再 close（`close()` 无未读数据 → 不触发 RST）。
+     - **QUIC**：`QuicServerEngine::graceful_shutdown()`——对每条存活连接 `lsquic_conn_going_away()`（**H3 GOAWAY**：客户端不再发新请求，在途流继续），并同步 `lsquic_engine_process_conns` 把 GOAWAY 帧发出去。
+  3. `grace`（默认 5s）后 `finalize()`：`ProxyCore::force_close_quic()` → `QuicServerEngine::force_close_all()`——对仍存活的连接 `lsquic_conn_close()`（**CONNECTION_CLOSE**）并同步 flush；再等 200ms 拍发后 `hard_stop()` 停所有 io_context → 线程 join → 进程退出。
+  - 记录方式：`QuicServerEngine` 用弱引用表 `live_sessions_` 追踪 server 连接（`on_new_conn` 登记，`on_conn_closed` 的 closed_cb 擦除）。client engine（上游）不在表内——上游空闲连接随硬停拆除（无客户端影响）。
 
 ## 12. 迁移走查
 

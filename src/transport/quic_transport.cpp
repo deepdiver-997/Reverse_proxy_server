@@ -756,6 +756,16 @@ QuicServerEngine::on_new_conn_cb(void* self, lsquic_conn_t* conn) {
     // after adopt_self() it stays alive until on_conn_closed releases it.
     auto session = std::make_shared<QuicTransportSession>(conn, addr);
     session->adopt_self();
+
+    // Track for graceful shutdown (GOAWAY on stop).  The conn's on_conn_closed
+    // fires the closed_cb, which erases this weak entry — no leak.  Captures a
+    // weak_ptr (not shared), so no self-cycle is recreated.
+    engine->live_sessions_.insert(session);
+    session->set_closed_cb(
+        [engine, weak = std::weak_ptr<QuicTransportSession>(session)] {
+            engine->live_sessions_.erase(weak);
+        });
+
     auto* ctx = reinterpret_cast<lsquic_conn_ctx_t*>(session.get());
 
     // Notify ProxyCore (passes a shared_ptr copy — the app may retain it).
@@ -800,6 +810,46 @@ void QuicServerEngine::on_old_scids_cb(void* ctx, void** /*peer_ctx*/,
     auto* engine = static_cast<QuicServerEngine*>(ctx);
     for (unsigned i = 0; i < n_cids; ++i)
         engine->demux_->remove_cid(cid_key(&cids[i]));
+}
+
+// ── graceful shutdown (server role) ───────────────────────
+
+void QuicServerEngine::graceful_shutdown() {
+    // Collect first (GOAWAY won't close conns, but be safe against the
+    // closed_cb erasing live_sessions_ while we iterate it).
+    std::vector<lsquic_conn_t*> goaway;
+    for (auto it = live_sessions_.begin(); it != live_sessions_.end();) {
+        if (auto session = it->lock()) {
+            goaway.push_back(session->conn());
+            ++it;
+        } else {
+            it = live_sessions_.erase(it);
+        }
+    }
+    for (lsquic_conn_t* conn : goaway)
+        lsquic_conn_going_away(conn); // H3 GOAWAY: no new streams, in-flight continue
+    // Flush the GOAWAY frames synchronously (process_conns → ea_packets_out).
+    lsquic_engine_process_conns(engine_);
+    spdlog::debug("QUIC: GOAWAY sent on {} connection(s)", goaway.size());
+}
+
+void QuicServerEngine::force_close_all() {
+    std::vector<lsquic_conn_t*> to_close;
+    for (auto it = live_sessions_.begin(); it != live_sessions_.end();) {
+        if (auto session = it->lock()) {
+            to_close.push_back(session->conn());
+            ++it;
+        } else {
+            it = live_sessions_.erase(it);
+        }
+    }
+    for (lsquic_conn_t* conn : to_close)
+        lsquic_conn_close(conn); // sends CONNECTION_CLOSE
+    // Generate + send the close frames NOW, while the worker still runs —
+    // otherwise the io_context stops and they never leave.
+    lsquic_engine_process_conns(engine_);
+    spdlog::debug("QUIC: CONNECTION_CLOSE sent on {} connection(s)",
+                  to_close.size());
 }
 
 // ── TLS lookups (server role) ─────────────────────────────
