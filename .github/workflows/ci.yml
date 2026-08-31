@@ -40,7 +40,14 @@ jobs:
             brew install cmake spdlog toml11 catch2 curl
           else
             sudo apt-get update
-            sudo apt-get install -y cmake libspdlog-dev libtoml11-dev catch2-3
+            sudo apt-get install -y cmake libspdlog-dev libtoml11-dev zlib1g-dev
+            # Catch2 v3 from source.  Ubuntu 24.04's apt `catch2` IS v3.4.0, but
+            # the packaging split (catch2 vs libcatch2-dev) and CMake-config
+            # layout vary; the tests use v3 headers + Catch2::Catch2WithMain, so
+            # build the exact version instead of gambling on the apt layout.
+            git clone --depth=1 --branch v3.7.1 https://github.com/catchorg/Catch2.git /tmp/Catch2
+            cmake -S /tmp/Catch2 -B /tmp/Catch2/build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
+            sudo cmake --build /tmp/Catch2/build --target install
           fi
 
       - name: Build BoringSSL
