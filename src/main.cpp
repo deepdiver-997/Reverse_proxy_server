@@ -44,6 +44,17 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < n; ++i)
         worker_ios.push_back(std::make_unique<asio::io_context>());
 
+    // Keep every io_context alive even when idle.  io_context::run() returns
+    // immediately when there is no pending work; after the refactor a worker no
+    // longer owns an acceptor/QUIC timer, so without a work guard an idle worker
+    // thread would exit and never process a posted hand-off (TCP fd / QUIC
+    // packet) from the ingress.
+    std::vector<asio::executor_work_guard<asio::io_context::executor_type>>
+        worker_guards;
+    for (auto& io : worker_ios)
+        worker_guards.emplace_back(asio::make_work_guard(*io));
+    auto ingress_guard = asio::make_work_guard(*ingress_io);
+
     // QUIC demux (shared UDP socket + CID routing), if enabled.
     std::unique_ptr<ebpf_quic_proxy::QuicPacketDemux> demux;
     ebpf_quic_proxy::SslCtxPtr server_ssl;
@@ -104,6 +115,7 @@ int main(int argc, char* argv[]) {
                 }
                 const int w =
                     static_cast<int>(rr.fetch_add(1) % cores.size());
+
                 const bool v6 = peer.remote_endpoint().address().is_v6();
                 // release() detaches the fd so `peer`'s destructor doesn't
                 // close it; the worker re-attaches it via assign().

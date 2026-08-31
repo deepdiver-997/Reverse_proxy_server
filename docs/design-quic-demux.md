@@ -47,6 +47,7 @@
 ```
 
 - **唯一交接点 = ingress → worker**。之后这条请求的生死（前端 + 后端 + relay）全在同一个 worker 手里，不再跨线程。
+- **worker 必须常驻**：worker 不再自持 acceptor/QUIC 定时器，空转时 `io_context::run()` 会立即返回、线程退出，ingress `post` 的投递 handler 永远不跑。实现用 `asio::make_work_guard` 让每个 io_context 有"伪 work、永不空返回"（§15 已踩过这个坑）。
 - 后端连接由 worker **自己**建立，不存在"再交给另一边的 worker"（见 §10）。
 
 ## 4. 核心概念：worker 是什么
@@ -230,18 +231,20 @@ demux：按 SCID → W（不看 4 元组）→ 连接不断
 
 ## 15. 已知问题：与真实 HTTP/3 客户端（curl/ngtcp2）握手互操作缺陷
 
-**状态：进行中排查。** 独立于本次 refactor 的既有缺陷（新旧代码同样失败），不属于 demux 层。
+**结论：lsquic 库级缺陷，非本 refactor 引入（新旧代码同样失败）。** 触发性条件是 **ngtcp2 发 20 字节的客户端 Initial DCID**；lsquic 自己的客户端用 8 字节 DCID 时协议完全成立（proxy→proxy 已实测通过、走通 GET）。
 
-**复现**：`brew` 的 curl（ngtcp2）`curl -k --http3-only https://127.0.0.1:8443/` → 服务端处理 Initial、发送 server Initial，但**收到 client Handshake 后无法将其匹配到既有 mini conn，而是当作新连接**。
+**复现**：`brew` 的 curl（ngtcp2 1.19）`curl -k --http3-only https://…` → 服务端处理 Initial、发 server Initial，但**收到 client Handshake 后无法匹配到既有 mini conn，当作新连接**，握手永不完成。
 
-**症状**（日志）：
-- `get_ssl_ctx_cb` 触发两次（第一次建 mini conn，第二次把 Handshake 当新连接又建一次）。
-- 服务端 `packets_out` 若干次（一直在重传 server Initial）。
-- `on_new_conn` 永不触发；握手不完成；curl 报 `Could not connect`。
-- 1-worker 配置同样失败 → 排除 demux 路由因素；所有包都被正确投递到同一 worker。
+**隔离实验（关键）**：
+- **proxy→proxy（lsquic client → lsquic server）：成功**。proxy B 的 server engine 触发 `on_new_conn` / `new stream quic:0` / `GET /`；demux 后续包 `CID(known)`。
+- **curl → server：失败**。`get_ssl_ctx_cb` 两次、`packets_out` 不停重传、`on_new_conn` 永不触发；1-worker 配置也失败（排除路由）。
 
-**包级证据**（demux 临时加日志观察到）：curl 发 QUIC v1，Initial（DCID len 20，first byte 0xc9）→ 之后 Handshake（DCID len 8 = 服务端 SCID，first byte 0xca）。版本、DCID 长度均正常。
+**根因（字节级定位）**：20 字节客户端 DCID 下，**服务端线上 Initial 的 SCID ≠ lsquic 登记进 `conns_hash`（并经 `ea_new_scids` 上报）的 SCID**。
 
-**根因假设**：lsquic `lsquic_engine_add_cid` 本应把服务端 SCID 插入 `conns_hash`（使 Handshake 按 SCID 命中）并触发 `ea_new_scids`，但实测 demux 看到 Handshake 的 8 字节 SCID 是 "new" 而非 "known"，说明 **SCID 从未被登记**。而 proxy→proxy（客户端同为 lsquic，ADR-9 记录可用）能通，差异疑似在 **ngtcp2 的 20 字节客户端 DCID** 或 lsquic 版本/引擎设置路径。待验证 `lsquic_engine_add_cid` 是否被调用、SCID 是否正确入 hash。
+- 服务端 `ea_new_scids` 登记 SCID = `0e225f364e619173`。
+- curl 的 Handshake DCID = `17eb63b17df0a06b`（回显服务端线上 Initial SCID 字段）。
+- 两者不等 → lsquic 按 Handshake DCID 查 `conns_hash` 不中，把 Handshake 当新连接（又派发一个 SCID）→ 失败；我的 demux 同因登记键与包 DCID 不中而报 `CID(new)`。
 
-**下一步**：隔离验证 SCID 入 hash 路径；对比 lsquic 官方 `http_server` 对同款 curl 的行为。
+lsquic 自己的客户端（8 字节 DCID）时线上 SCID 与登记 SCID 一致，故命中。**这是 lsquic 在客户端 DCID 为 MAX_CID_LEN(20) 时 SCID 生成/登记不一致的库 bug**，代理层不可修，需 lsquic 修复/升级（或对本例无法凭代理手段规避）。
+
+**顺带修复的真 bug（本 refactor 引入，非此缺陷）**：worker 的 io_context 空转时 `io_context::run()` 立即返回、线程退出，导致 ingress `post` 的投递 handler（TCP fd / QUIC 包）永不执行——`quic_port=0` 且空闲时尤其明显。修复 = `asio::make_work_guard` 让每个 io_context 常驻（见 §3）。
