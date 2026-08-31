@@ -76,6 +76,23 @@ worker 不是"跑 TCP 的 io_context 线程"或"跑 QUIC 的 engine 线程"二�
 
 一句话：**io_context 跑的是"这条请求链路上所有 asio socket 的 IO + 定时器 + demux 投递"，引擎只是搭在同一条线程上被 handler 顺带驱动的状态机。** 引擎自己一条 `while` + 条件变量就能驱动；但 relay 要 asio，所以 worker 线程统一用 io_context 更自然。
 
+### 5.1 两种事件循环模型（lsquic 属于"状态机"这一极）
+
+按"谁拥有事件循环 / 谁拥有 socket"可以把 QUIC 引擎粗分成**两个极**，分界线与"内核 TCP 栈 vs 手写 raw-IP TCP 栈"是同一条：
+
+| 极 | 类比 | 代表 | 拥有循环/socket | 调用方式 |
+|---|---|---|---|---|
+| **状态机库（pull）** | 给你 raw IP，TCP 栈自己写 | lsquic、ngtcp2、quiche | 应用 | 应用泵包进去、定时 tick、同步 `packets_out` 回调 |
+| **协议驱动 / 像 socket（push）** | 给你内核 TCP，栈库管 | msquic、quic-go、aioquic | 库（内部线程 + datapath） | 应用注册回调表，库主动驱动 |
+
+"像 socket"这一极在**流层面**的手感确实和 TCP 很像：应用读/写一个 stream 对象，库管收包、重传、拥塞控制。但类比有三处不完美：
+
+1. **多路复用**：一条 QUIC 连接 = 很多 stream，应用要分别管连接生命周期和流生命周期；内核 TCP 是"一个 socket = 一条有序字节流"，没有"连接对象挂很多通道"这回事。
+2. **连接级事件仍漏到 API**：connect/accept、shutdown、对端地址变化（迁移）、0-RTT、TLS/ALPN——即使 msquic/quic-go 里这些也是应用写的连接回调，不像 TCP 那样内核全包。
+3. **"同步接口"通常不是内核意义的阻塞**：quic-go 的 `Read` 阻塞的是一个 goroutine（事件循环在别的 goroutine 跑）；msquic 是纯异步回调 + `QUIC_STATUS_PENDING`。真正的阻塞读在 QUIC 里不存在——多路复用连接没法像单流 TCP 那样停住整个 socket。
+
+本项目的意义：**我们明确站在左极**——应用（ingress + worker 的 io_context）拥有事件循环，lsquic 只是被 handler 顺带驱动的状态机。这正是 §5 成立的前提，也是为什么换引擎（如换到 msquic）要重写整个事件驱动层：不是换"引擎"，是换"谁拥有循环"这一整层。
+
 ## 6. QUIC 入站：demux + post（迁移安全）
 
 ### 6.1 CID 路由（level-1 路由：DCID → worker）
