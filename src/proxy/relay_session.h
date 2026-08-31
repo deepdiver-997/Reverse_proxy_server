@@ -33,6 +33,17 @@ namespace ebpf_quic_proxy {
 /// partially-consumed body can't be replayed).
 class RelaySession : public std::enable_shared_from_this<RelaySession> {
 public:
+    /// Explicit phase of the relay's state machine — "which callback chain is
+    /// in flight" (see docs/relay-session.md).  Used by shutdown logic to know
+    /// whether a client FIN is safe, instead of ad-hoc flags.
+    enum class Phase {
+        kRequest,  // waiting in request_phase for the next request (read only)
+        kForward,  // request parsed, being sent to / waiting on the backend
+        kResponse, // backend response parsed, writing it back to the client
+        kBridge,   // CONNECT tunnel / WebSocket 101 byte bridge
+        kClosed,   // teardown — terminal
+    };
+
     /// `client_codec` matches the client's transport; `h1_codec`/`h3_codec`
     /// are both offered for the BACKEND side — the relay picks one per request
     /// from the routed endpoint's protocol (TCP → H1, QUIC → H3).
@@ -45,7 +56,7 @@ public:
 
     /// Graceful shutdown (server stopping): close this client connection
     /// without RST.
-    ///   - idle (between requests, no pending writes): FIN (shutdown_send) now —
+    ///   - idle (Phase::kRequest, no pending writes): FIN (shutdown_send) now —
     ///     the pending request read sees the peer's EOF and tears down cleanly.
     ///   - mid-exchange: mark draining — finish the current response, then FIN +
     ///     drain instead of looping for the next request (see after_client_response).
@@ -53,6 +64,9 @@ public:
     ///     server's grace period hard-stops the io_context.
     /// Must be called on this relay's worker thread.
     void graceful_close();
+
+    /// Current phase (for logging / introspection).
+    Phase phase() const { return phase_; }
 
 private:
     void request_phase();
@@ -79,6 +93,10 @@ private:
     void gracefully_close_client();
     void drain_client();
 
+    // Phase bookkeeping.
+    void goto_phase(Phase p);
+    static const char* phase_name(Phase p);
+
     ITransportStreamPtr client_;
     ITransportStreamPtr backend_;
     ICodec* client_codec_;  // owned by ProxyCore, outlives this
@@ -101,11 +119,10 @@ private:
     bool request_is_upgrade_ = false; // client asked for an Upgrade (WebSocket)
     bool done_ = false;
     // Graceful shutdown state:
-    //   idle_waiting_ — currently waiting in request_phase for the next request
-    //                   (only a read pending, no client writes → FIN is safe).
-    //   draining_     — server stopping: close gracefully at the next safe point
-    //                   instead of looping keep-alive.
-    bool idle_waiting_ = true;
+    //   phase_   — explicit state (Phase::kRequest means "read-only, FIN safe").
+    //   draining_ — server stopping: close gracefully at the next safe point
+    //               instead of looping keep-alive.
+    Phase phase_ = Phase::kRequest;
     bool draining_ = false;
 };
 

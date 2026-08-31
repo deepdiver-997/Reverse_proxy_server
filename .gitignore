@@ -1,0 +1,16 @@
+.cache/
+.claude/
+certs/
+build/
+build_asan/
+cmake-build-*/
+.vscode/
+.idea/
+*.swp
+*.o
+*.out
+.DS_Store
+.gitignore
+docs/crash_report.md
+# third_party/ is gitlink submodules (see .gitmodules)
+third_party/*/build/

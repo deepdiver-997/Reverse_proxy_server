@@ -22,7 +22,7 @@ void RelaySession::start() { request_phase(); }
 
 void RelaySession::request_phase() {
     auto self = shared_from_this();
-    idle_waiting_ = true; // only a read is pending — FIN is safe here
+    goto_phase(Phase::kRequest); // only a read is pending — FIN is safe here
     client_codec_->async_parse_request(
         client_,
         [this, self](asio::error_code ec, HttpRequestHead head,
@@ -35,7 +35,7 @@ void RelaySession::request_phase() {
                 teardown();
                 return;
             }
-            idle_waiting_ = false; // an exchange is beginning — no more FIN
+            goto_phase(Phase::kForward); // an exchange is beginning — no more FIN
             client_keep_alive_ = keep_alive;
             request_method_ = head.method;
             client_version_ = head.version; // echo the client's wire version
@@ -228,6 +228,7 @@ void RelaySession::start_tunnel() {
 }
 
 void RelaySession::bridge_mode() {
+    goto_phase(Phase::kBridge);
     // Two independent event-driven pumps: client ⇄ target.  When either side
     // ends (EOF/error), teardown closes both.
     pump_bytes(client_, backend_);
@@ -307,6 +308,7 @@ void RelaySession::reconnect_backend_fresh() {
 }
 
 void RelaySession::response_phase() {
+    goto_phase(Phase::kResponse);
     auto self = shared_from_this();
     backend_codec_->async_parse_response(
         backend_,
@@ -414,10 +416,10 @@ void RelaySession::write_error(HttpStatus status, const std::string& msg) {
 void RelaySession::graceful_close() {
     if (done_)
         return;
-    spdlog::debug("relay: graceful_close {} (idle_waiting={}, draining={})",
-                  client_->stream_id(), idle_waiting_, draining_);
+    spdlog::debug("relay: graceful_close {} (phase={}, draining={})",
+                  client_->stream_id(), phase_name(phase_), draining_);
     draining_ = true; // close at the next safe point, don't loop keep-alive
-    if (idle_waiting_) {
+    if (phase_ == Phase::kRequest) {
         // Between requests: only a read is pending, no client writes.  FIN now.
         // The pending request_phase read sees the peer's EOF and tears down
         // cleanly — close() then finds nothing unread, so no RST.  If a request
@@ -427,6 +429,24 @@ void RelaySession::graceful_close() {
     // Mid-exchange: can't shutdown_send yet (may have pending client writes).
     // draining_ is set; after_client_response does the graceful close once the
     // current response is fully written.
+}
+
+void RelaySession::goto_phase(Phase p) {
+    if (phase_ != p) {
+        spdlog::debug("relay: phase {} -> {}", phase_name(phase_), phase_name(p));
+        phase_ = p;
+    }
+}
+
+const char* RelaySession::phase_name(Phase p) {
+    switch (p) {
+        case Phase::kRequest: return "request";
+        case Phase::kForward: return "forward";
+        case Phase::kResponse: return "response";
+        case Phase::kBridge: return "bridge";
+        case Phase::kClosed: return "closed";
+    }
+    return "?";
 }
 
 void RelaySession::gracefully_close_client() {
@@ -459,6 +479,7 @@ void RelaySession::teardown() {
     if (done_)
         return;
     done_ = true;
+    goto_phase(Phase::kClosed);
     spdlog::debug("relay: tearing down {}", client_->stream_id());
     client_->async_shutdown([](asio::error_code) {});
     close_backend();
