@@ -14,8 +14,23 @@ A stock lsquic HTTP/3 server (v4.7.0 and v4.9.4, both built from source) fails t
 complete a QUIC handshake with **ngtcp2/curl**, while lsquic's own client completes
 fine. Instrumented investigation (deterministic SCID generator, per-call-site
 markers, `SSL_do_handshake` tracing) shows the failure is **not** a SCID/DCID-length
-issue — that earlier reading was a misattribution. There are three independent
+issue — that earlier reading was a misattribution. There are three reported
 defects.
+
+### Update (verified fix — defects 1 & 2 only, defect 3 was a symptom)
+Both defects are fixed by a two-hunk patch
+(`third_party/patches/lsquic-4.7.0-http3-interop-a-b.patch`):
+1. `iquic_lookup_cert`: fall back to the default cert when no SNI (don't return 0).
+2. Re-enable the RFC 9000 §14.1 Initial padding in `lsquic_mini_conn_ietf.c`.
+
+With both applied, the handshake completes and the full H3→H1 proxy path serves
+curl on BOTH `https://localhost:PORT/` (SNI) and `https://127.0.0.1:PORT/` (no SNI):
+`curl -k --http3-only` → 200 OK.
+
+Note: "defect 3" (SSL_do_handshake WANT_READ forever) was **not** an independent
+bug — it is a downstream symptom of defect 2: the unpadded Initial is dropped by
+the strict client, so the server never receives the client's Handshake and its
+TLS waits forever for input. Once the Initial is padded, the handshake completes.
 
 ### Environment
 - lsquic 4.7.0 and 4.9.4 (built from source, same repro).
