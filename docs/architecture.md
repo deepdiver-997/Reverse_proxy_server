@@ -30,13 +30,13 @@
 
 | 抽象 | 语义 | TCP | QUIC server（H3 客户端） | QUIC client（H3 上游） |
 |---|---|---|---|---|
-| 引擎/监听 | 接受/发起连接 | `TcpTransportListener`（acceptor） | `QuicTransportListener`（UDP + lsquic server 引擎） | `QuicClientEngine`（UDP + lsquic client 引擎） |
+| 引擎/监听 | 接受/发起连接 | ingress 的 TCP acceptor（`ReverseProxyServer`，accept→投递 fd） | `QuicPacketDemux` + `QuicServerEngine`（共享 UDP + lsquic server 引擎） | `QuicClientEngine`（UDP + lsquic client 引擎） |
 | Session | 一条「连接」 | `TcpTransportSession`（1 session = 1 连接 = 1 stream） | `QuicTransportSession`（1 连接 = N 流） | 复用 `QuicTransportSession` |
 | Stream | 有序可靠字节流 | `TcpTransportStream`（asio socket） | `QuicTransportStream`（lsquic stream） | 复用 `QuicTransportStream` |
 
 关键差异：
 - **TCP 里 session 与 stream 1:1 一起出生；QUIC 里 1 个连接上可动态开多条流**（请求多路复用）。因此 `ITransportSession::set_new_stream_cb` 在 TCP 下同步触发一次、QUIC 下异步触发 N 次。
-- **lsquic 强制一引擎一角色**（源码断言，无 server|client 合并）：H3 客户端由 `QuicTransportListener` 的 server 引擎服务；H3 上游由 `QuicClientEngine`（`LSENG_HTTP`）主动发起出站连接。两个引擎各有独立 UDP socket + 驱动循环，但**共享流/会话类与 HTTP/3 头集接口（HSI）**——流的读写、QPACK 解码、`get_hset`/`send_headers` 全部角色无关。
+- **lsquic 强制一引擎一角色**（源码断言，无 server|client 合并）：H3 客户端由 `QuicServerEngine`（`QuicPacketDemux` 按 CID 投递包）服务；H3 上游由 `QuicClientEngine`（`LSENG_HTTP`）主动发起出站连接。两个引擎各有独立 UDP socket + 驱动循环，但**共享流/会话类与 HTTP/3 头集接口（HSI）**——流的读写、QPACK 解码、`get_hset`/`send_headers` 全部角色无关。
 
 H3 上游连接复用的驱动模型：`QuicClientEngine::connect(endpoint)` → `lsquic_engine_connect`（同步触发 `on_new_conn`，把 endpoint 挂到 session）→ 握手期间调用 `lsquic_conn_make_stream`，流在握手完成后由 `on_new_stream` 送达（无需显式等 `on_conn_established`，4.7 只有可选的 `on_hsk_done`）。详见 [transport.md](transport.md) 与 [ADR-9](design-decisions.md#adr-9quic-客户端引擎h3-上游)。
 
@@ -67,7 +67,7 @@ H3 上游连接复用的驱动模型：`QuicClientEngine::connect(endpoint)` →
 ### H1 反代（TCP 客户端 → H1 后端）
 
 ```
-client ─▶ TcpTransportListener.async_accept ─▶ TcpTransportSession
+client ─▶ ReverseProxyServer（ingress acceptor）─▶ TcpTransportSession
       ─▶ on_stream：选 H1Codec ─▶ RelaySession.request_phase
       ─▶ H1Codec.async_parse_request ─▶ Router.route(head)
       ─▶ UpstreamPool.async_connect（TCP keep-alive 池复用）
@@ -79,7 +79,7 @@ client ─▶ TcpTransportListener.async_accept ─▶ TcpTransportSession
 ### H3 客户端 → H1 后端
 
 ```
-client ─▶ QuicTransportListener（一个 UDP socket 收所有人，按 CID 解复用）
+client ─▶ QuicPacketDemux（一个共享 UDP socket 收所有人，按 CID 解复用）
       ─▶ lsquic_engine_packet_in ─▶ on_new_stream ─▶ ProxyCore.on_stream（H3Codec）
       ─▶ RelaySession：H3Codec.async_parse_request（QPACK 解码头 → IR，body 为 DATA 读到 FIN）
       ─▶ 路由 ─▶ TCP 后端池 ─▶ H1Codec.async_write_request
