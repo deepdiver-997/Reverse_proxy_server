@@ -75,6 +75,23 @@ add_executable(lsquic_h3_min
 target_include_directories(lsquic_h3_min PRIVATE ${BORINGSSL_ROOT}/include)
 target_link_libraries(lsquic_h3_min PRIVATE lsquic)
 
+# ── lsquic A+B interop patch guard ────────────────────────
+# third_party/ is gitignored, so a fresh submodule checkout silently loses the
+# vendored H3-interop patch and the H3 path breaks again.  This custom target
+# re-applies it to the vendored source and fails loudly if the prebuilt
+# liblsquic.a is stale (built from unpatched source).  It runs before every
+# target that links lsquic — deliberately NOT ALL, so test-only builds
+# (proxy_tests doesn't link lsquic) stay unblocked.
+add_custom_target(lsquic-patch-guard
+    COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/ensure_lsquic_patch.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Checking lsquic interop patch on the vendored build"
+    VERBATIM
+)
+add_dependencies(ebpf-quic-proxy lsquic-patch-guard)
+add_dependencies(quic_demux_demo lsquic-patch-guard)
+add_dependencies(lsquic_h3_min lsquic-patch-guard)
+
 # ── Tests ─────────────────────────────────────────────────
 
 add_executable(proxy_tests
