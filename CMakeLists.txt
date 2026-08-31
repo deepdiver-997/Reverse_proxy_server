@@ -55,6 +55,15 @@ target_link_libraries(ebpf-quic-proxy PRIVATE
     lsquic
 )
 
+# ── Examples ──────────────────────────────────────────────
+
+# Minimal prototype of the CID-based demux (level-1 routing DCID -> engine).
+add_executable(quic_demux_demo
+    examples/quic_demux_demo.cpp
+)
+target_include_directories(quic_demux_demo PRIVATE ${BORINGSSL_ROOT}/include)
+target_link_libraries(quic_demux_demo PRIVATE lsquic)
+
 # ── Tests ─────────────────────────────────────────────────
 
 add_executable(proxy_tests
