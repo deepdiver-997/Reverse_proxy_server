@@ -223,6 +223,17 @@ acceptor_.async_accept([this](asio::error_code ec, asio::ip::tcp::socket peer) {
 | TLS | 不变：server SSL_CTX 一次性创建、不可变、跨线程共享只读（现状已是）；每 worker 自建 client SSL_CTX。 |
 | `UpstreamPool` | 不变（已是私有 pool + 自带 client engine）。 |
 
+## 11.5 服务编排与优雅关闭（ReverseProxyServer）
+
+`src/proxy/reverse_proxy_server.{h,cpp}` 把本蓝图（§3 的 N+1 线程布局）封装成一个类：
+
+- `run()`：装 SIGINT/SIGTERM → `start()` → `wait()`，信号后优雅退出返回 0。嵌入用 `start()/wait()/stop()`。
+- `start()`：建 ingress/worker io_context + work guard、demux、共享 server TLS ctx、N 个 ProxyCore、TCP acceptor，起 N+1 线程。acceptor 与 demux 全挂在 ingress 上，与 §3 一致。
+- `stop()`（线程安全）→ 在 ingress 线程上执行：
+  1. `acceptor_.cancel()` + `demux_->stop()`（cancel UDP recv，`on_packet` 遇 `operation_aborted` 不复位）——**不再接新连接**。
+  2. 每 worker `ProxyCore::graceful_shutdown()`（post 到该 worker）：遍历 `live_relays_`（弱引用表），对空闲 keep-alive 客户端 `shutdown_send`（FIN，pending read 会看到对端 EOF → teardown）；在途请求置 `draining_`，响应完成后 FIN + drain 到 EOF 再 close（`close()` 无未读数据 → 不触发 RST）。UDP/QUIC 无 FIN 语义，靠 `grace` 硬停兜底。
+  3. `grace`（默认 5s）后 `hard_stop()`：停所有 io_context → 线程 join → 进程退出。
+
 ## 12. 迁移走查
 
 ```

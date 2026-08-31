@@ -75,7 +75,26 @@ void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     auto session = std::make_shared<RelaySession>(
         std::move(stream), codec, h1_codec_.get(), h3_codec_.get(), &router_,
         &upstream_pool_);
+    live_relays_.insert(session); // pruned when the relay dies / at shutdown
     session->start();
+}
+
+void ProxyCore::graceful_shutdown() {
+    // Must run on this worker's thread (live_relays_ + the relays are worker-
+    // confined).  Safe to call from any thread.
+    asio::post(io_, [this] {
+        int live = 0;
+        for (auto it = live_relays_.begin(); it != live_relays_.end();) {
+            if (auto relay = it->lock()) {
+                relay->graceful_close();
+                ++live;
+                ++it;
+            } else {
+                it = live_relays_.erase(it);
+            }
+        }
+        spdlog::debug("graceful_shutdown: {} live relay(s) closed", live);
+    });
 }
 
 } // namespace ebpf_quic_proxy

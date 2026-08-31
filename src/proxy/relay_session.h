@@ -43,6 +43,17 @@ public:
     /// Begin relaying (enters the Request phase).
     void start();
 
+    /// Graceful shutdown (server stopping): close this client connection
+    /// without RST.
+    ///   - idle (between requests, no pending writes): FIN (shutdown_send) now —
+    ///     the pending request read sees the peer's EOF and tears down cleanly.
+    ///   - mid-exchange: mark draining — finish the current response, then FIN +
+    ///     drain instead of looping for the next request (see after_client_response).
+    ///   - tunnel: just marked draining; torn down when the peer closes or the
+    ///     server's grace period hard-stops the io_context.
+    /// Must be called on this relay's worker thread.
+    void graceful_close();
+
 private:
     void request_phase();
     void handle_connect(HttpRequestHead head); // CONNECT → tunnel
@@ -62,6 +73,11 @@ private:
     void after_client_response();
     void write_error(HttpStatus status, const std::string& msg);
     void teardown();
+
+    // Graceful-close plumbing: shutdown_send, then consume the peer's input
+    // until EOF so close() (via the stream's destructor) never RSTs.
+    void gracefully_close_client();
+    void drain_client();
 
     ITransportStreamPtr client_;
     ITransportStreamPtr backend_;
@@ -84,6 +100,13 @@ private:
     bool client_keep_alive_ = false;
     bool request_is_upgrade_ = false; // client asked for an Upgrade (WebSocket)
     bool done_ = false;
+    // Graceful shutdown state:
+    //   idle_waiting_ — currently waiting in request_phase for the next request
+    //                   (only a read pending, no client writes → FIN is safe).
+    //   draining_     — server stopping: close gracefully at the next safe point
+    //                   instead of looping keep-alive.
+    bool idle_waiting_ = true;
+    bool draining_ = false;
 };
 
 using RelaySessionPtr = std::shared_ptr<RelaySession>;

@@ -88,6 +88,12 @@ int QuicPacketDemux::add_worker(asio::io_context& worker_io,
 
 void QuicPacketDemux::start() { do_recv(); }
 
+void QuicPacketDemux::stop() {
+    // Cancels the pending async_receive_from / async_wait; on_packet sees
+    // operation_aborted and does not re-arm (already handled there).
+    socket_.cancel();
+}
+
 void QuicPacketDemux::register_cid(const std::string& key, int worker_idx) {
     std::lock_guard lock(cid_mu_);
     cid_to_worker_[key] = worker_idx;

@@ -10,8 +10,11 @@
 #include "upstream_pool.h"
 #include <asio.hpp>
 #include <memory>
+#include <set>
 
 namespace ebpf_quic_proxy {
+
+class RelaySession; // fwd — live_relays_ holds weak refs to these
 
 /// One worker: a single io_context thread hosting the relay (business), its
 /// frontend TCP sockets (handed over by the ingress thread), its QUIC server
@@ -31,6 +34,13 @@ public:
     /// TLS context, created once in main.
     void start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx);
 
+    /// Graceful shutdown (server stopping): FIN + drain every live frontend
+    /// connection on this worker.  Posts to this worker's io_context — callable
+    /// from any thread.  Idle keep-alive clients get FIN now (their pending read
+    /// sees the peer's EOF and tears down cleanly); in-flight exchanges finish,
+    /// then close gracefully instead of looping for the next request.
+    void graceful_shutdown();
+
 private:
     void on_session(ITransportSessionPtr session);
     void on_stream(ITransportStreamPtr stream, ICodec* codec);
@@ -41,6 +51,13 @@ private:
     std::unique_ptr<ICodec> h3_codec_;
     Router router_;
     UpstreamPool upstream_pool_;
+
+    /// Live client relays on this worker (weak — a relay removes itself by
+    /// dying; expired entries are pruned during graceful_shutdown).  Only ever
+    /// touched on this worker's thread.
+    std::set<std::weak_ptr<RelaySession>,
+             std::owner_less<std::weak_ptr<RelaySession>>>
+        live_relays_;
 };
 
 } // namespace ebpf_quic_proxy

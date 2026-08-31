@@ -21,6 +21,7 @@ worker i：    前端 socket + QUIC 引擎 + relay + 私有后端池（一条线
 
 - **TCP/QUIC 统一工作模型**：`ITransportSession` / `ITransportStream` 屏蔽传输差异，`ICodec` 屏蔽 H1/H3 差异。
 - **QUIC 共享 UDP 入口**：`QuicPacketDemux` 用 `lsquic_dcid_from_packet` 解析 DCID 并路由到 worker 的 `QuicServerEngine`；发送走 `ea_packets_out` 同步契约。
+- **优雅关闭**：`ReverseProxyServer` 编排 N+1 线程生命周期；`run()` 阻塞并装 SIGINT/SIGTERM。停服时先停止接入（cancel acceptor + demux），对空闲 keep-alive TCP 连接立即 `shutdown_send`，在途请求给 `grace` 时间完成后再 FIN + drain 到 EOF（`close()` 不触发 RST），最后硬停所有 io_context。
 - **基于主机的路由** + **私有后端池**：H1 后端 keep-alive 复用；H3 后端经 QUIC client 引擎多路复用（一条连接 N 请求流）。
 - **正向代理**：absolute-form 目标（`GET http://host/path`）直连 URL authority；https 走 `CONNECT` 隧道。
 - **字节桥隧道**：CONNECT 与 WebSocket Upgrade（101）切原始字节双向泵，完全绕过 codec。
@@ -31,7 +32,7 @@ worker i：    前端 socket + QUIC 引擎 + relay + 私有后端池（一条线
 
 ```
 src/
-  main.cpp                      入口：N+1 线程布局 + work guard + 信号优雅退出
+  main.cpp                      入口：加载配置 → ReverseProxyServer.run()（阻塞，信号优雅退出）
   config.{h,cpp}                TOML 配置解析
   transport/
     itransport_session.h        连接抽象
@@ -40,10 +41,11 @@ src/
     quic_transport.{h,cpp}      QUIC 引擎（QuicServerEngine / 客户端），lsquic 驱动
     quic_demux.{h,cpp}          QuicPacketDemux：共享 UDP socket + CID 路由（统一单入口）
   proxy/
+    reverse_proxy_server.{h,cpp} 整个代理编排类：ingress+worker 线程、run()/start()/wait()/stop()
     proxy_core.{h,cpp}          核心：接收 → 路由 → 转发（TCP/QUIC 同一入口）
     router.{h,cpp}              基于 Host 的路由表
     upstream_pool.{h,cpp}       后端端点池（轮询，lazy 连接，worker 私有）
-    relay_session.{h,cpp}       前后端字节/帧中继
+    relay_session.{h,cpp}       前后端字节/帧中继（含优雅关闭 drain）
   codec/
     icodec.h                    编解码抽象
     h1_codec.{h,cpp}            HTTP/1.1 编解码

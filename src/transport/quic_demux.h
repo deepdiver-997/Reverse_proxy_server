@@ -65,6 +65,11 @@ public:
     /// this, so all workers must be registered first.
     void start();
 
+    /// Graceful shutdown: cancel the UDP recv (and the write-watch).  Packets
+    /// already posted to workers still process; no new datagrams are received.
+    /// Call on the demux's io_context thread.
+    void stop();
+
     /// CID table — thread-safe; called from worker threads (engine SCID
     /// callbacks).  Key is cid_key() bytes.
     void register_cid(const std::string& key, int worker_idx);
