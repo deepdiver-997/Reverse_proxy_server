@@ -1,0 +1,135 @@
+# CI for ebpf-quic-proxy — runs on push to main and on PRs.
+#
+# Build chain (see docs/ci.md): Go → BoringSSL → lsquic (+ A+B interop patch)
+# → project (C++17).  third_party/{lsquic,boringssl} are gitlink submodules;
+# the interop patch is applied at build time by scripts/ensure_lsquic_patch.sh
+# (the CMake `lsquic-patch-guard` target re-verifies it on every link).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # fetch third_party/{lsquic,boringssl} at pinned commits
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25' # BoringSSL go.mod requires >= 1.25.0
+
+      - name: Install deps
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install cmake spdlog toml11 catch2 curl
+          else
+            sudo apt-get update
+            sudo apt-get install -y cmake libspdlog-dev libtoml11-dev catch2-3
+          fi
+
+      - name: Build BoringSSL
+        run: |
+          cmake -S third_party/boringssl -B third_party/boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build third_party/boringssl/build -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Apply interop patch + build lsquic
+        run: |
+          bash scripts/ensure_lsquic_patch.sh
+          cmake -S third_party/lsquic -B third_party/lsquic/build \
+            -DLSQUIC_LIBSSL=BORINGSSL \
+            -DBORINGSSL_INCLUDE=$PWD/third_party/boringssl/include \
+            -DBORINGSSL_LIB_ssl=$PWD/third_party/boringssl/build/libssl.a \
+            -DBORINGSSL_LIB_crypto=$PWD/third_party/boringssl/build/libcrypto.a \
+            -DLSQUIC_BIN=OFF -DLSQUIC_TESTS=OFF
+          cmake --build third_party/lsquic/build -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Build project
+        run: |
+          cmake -S . -B build
+          cmake --build build -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Unit tests
+        run: ./build/proxy_tests
+
+      - name: Patch guard self-check
+        run: bash scripts/ensure_lsquic_patch.sh
+
+      - name: TCP e2e — curl through the proxy
+        shell: bash
+        run: |
+          python3 -m http.server 3000 --bind 127.0.0.1 >/tmp/be.log 2>&1 &
+          BE_PID=$!
+          cat > /tmp/e2e.toml <<'EOF'
+          [listen]
+          address = "127.0.0.1"
+          port = 18080
+          num_threads = 2
+          quic_port = 0
+          [[backends]]
+          id = "app"
+          host = "127.0.0.1"
+          port = 3000
+          [[routes]]
+          host = "*"
+          backend = "app"
+          EOF
+          ./build/ebpf-quic-proxy /tmp/e2e.toml >/tmp/proxy.log 2>&1 &
+          PROXY_PID=$!
+          for i in $(seq 50); do curl -sf -m1 http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.1; done
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/)
+          echo "TCP e2e http_code=$code"
+          test "$code" = "200"
+          kill -INT $PROXY_PID; wait $PROXY_PID
+          kill $BE_PID 2>/dev/null || true
+
+      # H3 e2e — brew curl has ngtcp2/nghttp3; Ubuntu's system curl does not.
+      - name: H3 e2e — curl --http3 through the proxy (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p certs
+          openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes -subj "/CN=127.0.0.1"
+          cat > /tmp/e2e_h3.toml <<'EOF'
+          [listen]
+          address = "127.0.0.1"
+          port = 18081
+          num_threads = 2
+          quic_port = 18443
+          quic_cert_file = "certs/cert.pem"
+          quic_key_file = "certs/key.pem"
+          [[backends]]
+          id = "app"
+          host = "127.0.0.1"
+          port = 3000
+          [[routes]]
+          host = "*"
+          backend = "app"
+          EOF
+          python3 -m http.server 3000 --bind 127.0.0.1 >/tmp/be2.log 2>&1 &
+          BE2_PID=$!
+          ./build/ebpf-quic-proxy /tmp/e2e_h3.toml >/tmp/proxy2.log 2>&1 &
+          PROXY2_PID=$!
+          sleep 1
+          CURL=/opt/homebrew/opt/curl/bin/curl
+          a=$($CURL -sk --http3-only --max-time 10 -o /dev/null -w "%{http_code}" https://127.0.0.1:18443/)
+          b=$($CURL -sk --http3-only --max-time 10 -o /dev/null -w "%{http_code}" https://localhost:18443/)
+          echo "H3 e2e: no-SNI=$a SNI=$b"
+          test "$a" = "200" && test "$b" = "200"
+          kill -INT $PROXY2_PID; wait $PROXY2_PID
+          kill $BE2_PID 2>/dev/null || true
