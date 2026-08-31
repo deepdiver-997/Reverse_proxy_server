@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(ebpf-quic-proxy VERSION 0.1.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+# Core (src/, tests/) is C++17.  Only the lsquic H3 repro harness uses C++20
+# designated initializers (lsquic_h3_server_min.cpp), bumped per-target below.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -74,6 +76,7 @@ add_executable(lsquic_h3_min
 )
 target_include_directories(lsquic_h3_min PRIVATE ${BORINGSSL_ROOT}/include)
 target_link_libraries(lsquic_h3_min PRIVATE lsquic)
+set_property(TARGET lsquic_h3_min PROPERTY CXX_STANDARD 20)  # designated initializers
 
 # ── lsquic A+B interop patch guard ────────────────────────
 # third_party/ is gitignored, so a fresh submodule checkout silently loses the

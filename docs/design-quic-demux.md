@@ -1,8 +1,8 @@
 # 设计蓝图：统一单入口 + co-located worker（TCP accept + QUIC demux）
 
-> 状态：**已实现**（`src/transport/quic_demux.*`、ceo `QuicServerEngine`、`main.cpp` N+1 线程）。配套最小原型：`examples/quic_demux_demo.cpp`（已验证 `lsquic_dcid_from_packet` 解析 + CID 路由 + 迁移安全 + 表清理）。
+> 状态：**已实现**（`src/transport/quic_demux.*`、`QuicServerEngine`、`main.cpp` N+1 线程）。配套最小原型：`examples/quic_demux_demo.cpp`（已验证 `lsquic_dcid_from_packet` 解析 + CID 路由 + 迁移安全 + 表清理）。
 >
-> **⚠️ 已知互操作缺陷**：服务端引擎无法与真实 HTTP/3 客户端（curl/ngtcp2）完成握手——新旧代码均失败，是既有问题，见文末「已知问题」。
+> 与真实 HTTP/3 客户端（curl/ngtcp2）的握手互操作缺陷已定位并修复：`docs/lsquic-4.7.0-http3-interop-a-b.patch`（两处，见 §15），由 `scripts/ensure_lsquic_patch.sh` 自动保持应用。
 >
 > 本文是 `docs/design-quic-demux.md` 的改写版。相对旧版，核心变化不是 demux 本身，而是**把 worker 的定位讲清楚**：worker 不是"TCP 线程"或"QUIC 引擎线程"的二选一，而是一条 io_context 线程，顺带挂着 0~2 个 lsquic 引擎 + 一堆 TCP socket，前端与后端、引擎与 relay 全在一条线程上（co-located）。demux 只是入站 QUIC 的"统一单入口"。
 
@@ -231,22 +231,20 @@ demux：按 SCID → W（不看 4 元组）→ 连接不断
 
 ## 15. 已知问题：与真实 HTTP/3 客户端（curl/ngtcp2）握手互操作缺陷
 
-**结论：lsquic 库级缺陷，非本 refactor 引入（新旧代码同样失败）。** 触发性条件是 **ngtcp2 发 20 字节的客户端 Initial DCID**；lsquic 自己的客户端用 8 字节 DCID 时协议完全成立（proxy→proxy 已实测通过、走通 GET）。
+**最终结论：lsquic 库级缺陷，非本 refactor 引入（新旧代码同样失败），且已修复。** 完整调查报告在 `docs/lsquic-handshake-bug-report.md`（upstream issue #680 草稿），下面是结论摘要。
 
-**复现**：`brew` 的 curl（ngtcp2 1.19）`curl -k --http3-only https://…` → 服务端处理 Initial、发 server Initial，但**收到 client Handshake 后无法匹配到既有 mini conn，当作新连接**，握手永不完成。
+**三个缺陷，前两个被两处补丁修复，第三个是第二个的并发症（不是独立 bug）**：
 
-**隔离实验（关键）**：
-- **proxy→proxy（lsquic client → lsquic server）：成功**。proxy B 的 server engine 触发 `on_new_conn` / `new stream quic:0` / `GET /`；demux 后续包 `CID(known)`。
-- **curl → server：失败**。`get_ssl_ctx_cb` 两次、`packets_out` 不停重传、`on_new_conn` 永不触发；1-worker 配置也失败（排除路由）。
+1. **无 SNI → `CERT_CB_ERROR`**。按 IP 连接（curl 到 `127.0.0.1`，RFC 6066 不发 SNI）时 `iquic_lookup_cert` 在 HTTP/3 模式直接 `return 0` → BoringSSL 中止握手。lsquic 自己的客户端对 IP 也发 SNI，所以 lsquic↔lsquic 不触发。
+2. **ack-eliciting Initial 未填到 1200 字节（RFC 9000 §14.1）**。`lsquic_mini_conn_ietf.c` 里填充被注释（"改为 coalesced 后填，省一个包"），但"coalesced 后填"从未实现 → 服务端回 ~60 字节 Initial → ngtcp2 严格校验直接丢弃 → 握手死锁。
+3. 早期观测到的 "TLS 永远 WANT_READ、ServerHello 永不生成" **不是独立缺陷**——它是缺陷 2 的下游症状：客户端丢弃未填充的 Initial，服务端永远收不到 Handshake。
 
-**根因（字节级定位）**：20 字节客户端 DCID 下，**服务端线上 Initial 的 SCID ≠ lsquic 登记进 `conns_hash`（并经 `ea_new_scids` 上报）的 SCID**。
+**修复**：`docs/lsquic-4.7.0-http3-interop-a-b.patch`（两处 hunk：回退默认证书 + 恢复 Initial 填充）。打上后，完整 H3→H1 代理链路用 `curl -k --http3-only` 在 `localhost`（有 SNI）和 `127.0.0.1`（无 SNI）**均返回 200**。
 
-- 服务端 `ea_new_scids` 登记 SCID = `0e225f364e619173`。
-- curl 的 Handshake DCID = `17eb63b17df0a06b`（回显服务端线上 Initial SCID 字段）。
-- 两者不等 → lsquic 按 Handshake DCID 查 `conns_hash` 不中，把 Handshake 当新连接（又派发一个 SCID）→ 失败；我的 demux 同因登记键与包 DCID 不中而报 `CID(new)`。
+> ⚠️ **先前的根因结论（SCID 不一致 / 20 字节 DCID）是错误归因**，已推翻：那是在 TLS 停滞触发 SREJ 后，把 **Retry 包的 SCID** 误当成 Initial 的 SCID；20 字节 DCID 也是障眼法（curl 恰好同时满足 20 字节 DCID + OpenSSL + 对 IP 无 SNI，三个变量与 lsquic 客户端全不同）。此教训已写进 issue。
 
-lsquic 自己的客户端（8 字节 DCID）时线上 SCID 与登记 SCID 一致，故命中。**这是 lsquic 在客户端 DCID 为 MAX_CID_LEN(20) 时 SCID 生成/登记不一致的库 bug**，代理层不可修，需 lsquic 修复/升级（或对本例无法凭代理手段规避）。
+**补丁维护**：`third_party/` 被 gitignore，`git submodule update`/重检出会静默回退补丁。构建钩子 `scripts/ensure_lsquic_patch.sh`（CMake `lsquic-patch-guard` target）会在链接 lsquic 的目标构建前自动重新应用，并在 `liblsquic.a` 由未打补丁源码编出时**响亮失败**（给出重建命令）。
 
-最小复现 harness：`examples/lsquic_h3_server_min.cpp`（纯 lsquic+BoringSSL，不依赖代理层）——运行后用 `curl --http3` 即复现，其输出直接打印 `[REG]`（`ea_new_scids` 登记的 SCID）与 `[WIRE]`（线上 Initial 的 SCID）两值不等、`on_new_conn` 永不触发。报 upstream 的草稿：`docs/lsquic-handshake-bug-report.md`。
+最小复现 harness：`examples/lsquic_h3_server_min.cpp`（纯 lsquic+BoringSSL，不依赖代理层）——未打补丁的 lsquic 上 `curl --http3` 即复现。
 
 **顺带修复的真 bug（本 refactor 引入，非此缺陷）**：worker 的 io_context 空转时 `io_context::run()` 立即返回、线程退出，导致 ingress `post` 的投递 handler（TCP fd / QUIC 包）永不执行——`quic_port=0` 且空闲时尤其明显。修复 = `asio::make_work_guard` 让每个 io_context 常驻（见 §3）。
