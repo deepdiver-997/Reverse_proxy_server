@@ -22,6 +22,7 @@ worker i：    前端 socket + QUIC 引擎 + relay + 私有后端池（一条线
 - **TCP/QUIC 统一工作模型**：`ITransportSession` / `ITransportStream` 屏蔽传输差异，`ICodec` 屏蔽 H1/H3 差异。
 - **QUIC 共享 UDP 入口**：`QuicPacketDemux` 用 `lsquic_dcid_from_packet` 解析 DCID 并路由到 worker 的 `QuicServerEngine`；发送走 `ea_packets_out` 同步契约。
 - **优雅关闭**：`ReverseProxyServer` 编排 N+1 线程生命周期；`run()` 阻塞并装 SIGINT/SIGTERM。停服时先停止接入（cancel acceptor + demux）——TCP 侧空闲 keep-alive 连接立即 `shutdown_send`（FIN）、在途请求给 `grace` 时间完成后 FIN + drain 到 EOF（`close()` 不触发 RST）；QUIC 侧先发 **GOAWAY**（在途 H3 流继续），grace 后对剩余连接发 **CONNECTION_CLOSE** 再硬停。
+- **IPv4/IPv6 双栈**：`dual_stack = true` 时前端 TCP/QUIC 同时监听两个族（后端 TCP 本就双栈、QUIC 上游按解析结果自动选族）。IPv6 不可用 → 响亮警告 + 回退 IPv4-only，绝不静默。
 - **基于主机的路由** + **私有后端池**：H1 后端 keep-alive 复用；H3 后端经 QUIC client 引擎多路复用（一条连接 N 请求流）。
 - **正向代理**：absolute-form 目标（`GET http://host/path`）直连 URL authority；https 走 `CONNECT` 隧道。
 - **字节桥隧道**：CONNECT 与 WebSocket Upgrade（101）切原始字节双向泵，完全绕过 codec。
@@ -98,6 +99,7 @@ cmake --build build -j
 address       = "0.0.0.0"
 port          = 8080
 num_threads   = 4            # worker 数：1 ingress + N worker
+dual_stack    = true         # 前端同时监听 IPv4 + IPv6（见下）
 quic_port     = 8443         # QUIC UDP 端口；0 = 关闭 QUIC
 quic_cert_file = "certs/cert.pem"
 quic_key_file  = "certs/key.pem"
@@ -123,6 +125,7 @@ backend = "api"             # 兜底路由
 | `listen.address` | `0.0.0.0` | TCP 监听地址（ingress accept） |
 | `listen.port` | `8080` | TCP/HTTP/1.1 端口 |
 | `listen.num_threads` | `1` | **worker 数**：总线程 = `num_threads` + 1（ingress）。每 worker = 一条 io_context 线程，host 前端 + QUIC 引擎 + relay + 私有后端池 |
+| `listen.dual_stack` | `false` | 前端同时监听 IPv4 + IPv6：TCP acceptor 绑 `::` + `IPV6_V6ONLY=0`，QUIC demux 多开一个 v6 UDP socket（双 socket，v4 不做 v4-mapped）。IPv6 不可用时**响亮警告并回退 IPv4-only**（不静默）。后端侧 TCP 已双栈（resolver），QUIC 上游按解析结果族自动选 socket |
 | `listen.quic_port` | `0` | QUIC UDP 端口（ingress 共享 socket），`0` 关闭 QUIC |
 | `listen.quic_cert_file` / `quic_key_file` | `certs/cert.pem` / `key.pem` | QUIC TLS 证书（所有 worker 共享同一只读 ctx） |
 | `backends[].id/host/port/weight` | — | 后端端点 |

@@ -47,6 +47,21 @@ TEST_CASE("config: protocol = \"h3\" selects QUIC upstream", "[config]") {
     REQUIRE(cfg.backends[0].protocol == TransportProtocol::QUIC);
 }
 
+TEST_CASE("config: dual_stack defaults to false", "[config]") {
+    auto path = write_temp_toml("[listen]\nport = 8080\n");
+    auto cfg = load_config(path);
+    REQUIRE_FALSE(cfg.dual_stack);
+}
+
+TEST_CASE("config: dual_stack = true is parsed", "[config]") {
+    auto path = write_temp_toml(
+        "[listen]\n"
+        "port = 8080\n"
+        "dual_stack = true\n");
+    auto cfg = load_config(path);
+    REQUIRE(cfg.dual_stack);
+}
+
 TEST_CASE("config: mixed h1/h3 backends", "[config]") {
     auto path = write_temp_toml(
         "[listen]\n"

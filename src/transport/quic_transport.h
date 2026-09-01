@@ -341,9 +341,11 @@ public:
 
 private:
     asio::io_context& io_;
-    asio::ip::udp::socket socket_;      // bound to an ephemeral local port
+    asio::ip::udp::socket socket_;      // IPv4, bound to an ephemeral port
+    asio::ip::udp::socket socket6_;     // IPv6, lazily opened on first v6 connect
     asio::steady_timer tick_timer_;
-    int raw_fd_ = -1;                   // native fd for synchronous sendto
+    int raw_fd_ = -1;                   // native fd for synchronous sendto (v4)
+    int raw6_fd_ = -1;                  // ... and v6 (-1 when unavailable)
     lsquic_engine_t* engine_ = nullptr;
     NewClientSessionCallback new_session_cb_;
     bool started_ = false;              // recv/tick loop armed on first connect
@@ -352,15 +354,22 @@ private:
     // (make_client_ssl_ctx) and injected; shared read-only across threads.
     SslCtxPtr ssl_ctx_;
 
-    // Receiving.
+    // Receiving (one buffer/endpoint per family — each socket has its own
+    // pending recv).
     std::array<char, 65536> recv_buf_{};
     asio::ip::udp::endpoint recv_endpoint_;
+    std::array<char, 65536> recv6_buf_{};
+    asio::ip::udp::endpoint recv6_endpoint_;
     void do_recv();
-    void on_packet(asio::error_code ec, std::size_t n);
+    void do_recv6();
+    void on_packet(asio::error_code ec, std::size_t n, bool is_v6);
+    bool ensure_v6_socket();            // open+bind+arm recv for a v6 upstream
     void schedule_tick();
     void on_tick(asio::error_code ec);
     void arm_send_retry();
+    void arm_write_watch(asio::ip::udp::socket& s, bool& armed);
     bool send_retry_armed_ = false;
+    bool send_retry6_armed_ = false;
 
     // Stashed before lsquic_engine_connect, consumed by the synchronous
     // on_new_conn — safe because on_new_conn fires inside connect().

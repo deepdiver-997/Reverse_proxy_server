@@ -27,12 +27,13 @@ constexpr unsigned kServerCidLen = 8;
 void to_sockaddr(const asio::ip::udp::endpoint& ep,
                  struct sockaddr_storage* sa);
 
-/// Send a batch of lsquic out-specs as UDP datagrams on `fd`.  Returns how many
-/// were sent; `*blocked` is set if any hit EAGAIN — lsquic retains the unsent
-/// packets and expects lsquic_engine_send_unsent_packets() once the socket
-/// drains.
-unsigned send_specs(int fd, const lsquic_out_spec* specs, unsigned count,
-                    bool* blocked);
+/// Send a batch of lsquic out-specs as UDP datagrams, picking `fd_v4` or
+/// `fd_v6` by each spec's destination family (a v4 socket can't send to a v6
+/// address; a batch may mix families).  Returns how many were sent;
+/// `*blocked` is set if any hit EAGAIN — lsquic retains the unsent packets and
+/// expects lsquic_engine_send_unsent_packets() once the socket drains.
+unsigned send_specs(int fd_v4, int fd_v6, const lsquic_out_spec* specs,
+                    unsigned count, bool* blocked);
 
 /// Raw-bytes key for a CID (length-prefixed, so it's unambiguous regardless of
 /// the CID length).  Used as the CID→worker table key.
@@ -51,7 +52,10 @@ std::string cid_key(const lsquic_cid_t* cid);
 /// report EAGAIN here so a single write-watch can coordinate the shared socket.
 class QuicPacketDemux {
 public:
-    QuicPacketDemux(asio::io_context& io, uint16_t port);
+    /// `dual_stack` opens a second IPv6 UDP socket on the same port so QUIC
+    /// clients can connect over either family.  If the IPv6 bind fails it logs
+    /// a loud warning and continues IPv4-only.
+    QuicPacketDemux(asio::io_context& io, uint16_t port, bool dual_stack);
     ~QuicPacketDemux();
 
     QuicPacketDemux(const QuicPacketDemux&) = delete;
@@ -75,23 +79,31 @@ public:
     void register_cid(const std::string& key, int worker_idx);
     void remove_cid(const std::string& key);
 
-    /// Shared send fd — workers sendmsg on it directly (UDP sendto is
-    /// thread-safe, single-datagram atomic).
-    int native_fd() const { return raw_fd_; }
+    /// Shared send fds (v4 + v6, when dual-stack) — workers sendmsg directly
+    /// on the one matching each destination's family (UDP sendto is
+    /// thread-safe, single-datagram atomic).  v6_fd() is -1 when the IPv6
+    /// socket failed to bind.
+    int v4_fd() const { return raw_fd_; }
+    int v6_fd() const { return raw6_fd_; }
 
     /// Called from a worker thread when ea_packets_out hit EAGAIN.  Arms the
-    /// single write-watch; when the socket drains, all workers are asked to
-    /// flush lsquic_engine_send_unsent_packets().
+    /// write-watch on whichever socket(s) drained; when they do, all workers
+    /// are asked to flush lsquic_engine_send_unsent_packets().
     void notify_tx_blocked();
 
 private:
     asio::io_context& io_;
-    asio::ip::udp::socket socket_;
+    asio::ip::udp::socket socket_;   // IPv4
+    asio::ip::udp::socket socket6_;  // IPv6 (dual_stack; default-constructed)
     int raw_fd_ = -1;
+    int raw6_fd_ = -1;
 
     std::array<char, 65536> recv_buf_{};
     asio::ip::udp::endpoint recv_endpoint_;
     struct sockaddr_storage local_sa_{}; // cached once at bind — constant
+    std::array<char, 65536> recv6_buf_{};
+    asio::ip::udp::endpoint recv6_endpoint_;
+    struct sockaddr_storage local6_sa_{};
 
     struct WorkerSlot {
         asio::io_context* io = nullptr;
@@ -103,9 +115,12 @@ private:
     std::map<std::string, int> cid_to_worker_;
 
     bool send_retry_armed_ = false;
+    bool send_retry6_armed_ = false;
 
     void do_recv();
-    void on_packet(asio::error_code ec, std::size_t n);
+    void do_recv6();
+    void on_packet(asio::error_code ec, std::size_t n,
+                   const struct sockaddr_storage& local_sa);
 
     /// DCID → worker.  Known CID routes by the table; unknown CID (new
     /// connection) hashes the source address.  Returns -1 to drop.
@@ -113,6 +128,7 @@ private:
               const std::string& src_addr);
 
     void arm_send_retry();
+    void arm_write_watch(asio::ip::udp::socket& s, bool& armed);
 };
 
 } // namespace ebpf_quic_proxy

@@ -42,7 +42,8 @@ void ReverseProxyServer::start() {
 
     // QUIC demux (shared UDP socket + CID routing), if enabled.
     if (cfg_.quic_port > 0) {
-        demux_ = std::make_unique<QuicPacketDemux>(*ingress_io_, cfg_.quic_port);
+        demux_ = std::make_unique<QuicPacketDemux>(*ingress_io_, cfg_.quic_port,
+                                                   cfg_.dual_stack);
         // ONE shared server TLS context — immutable after setup, safe to share
         // read-only across the worker engines.
         server_ssl_ = make_server_ssl_ctx(cfg_.quic_cert_file,
@@ -64,12 +65,44 @@ void ReverseProxyServer::start() {
     auto listen_ep = asio::ip::tcp::endpoint(
         asio::ip::make_address(cfg_.listen_addr), cfg_.listen_port);
     acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(*ingress_io_);
-    acceptor_->open(listen_ep.address().is_v6() ? asio::ip::tcp::v6()
-                                                : asio::ip::tcp::v4());
     int on = 1;
-    ::setsockopt(acceptor_->native_handle(), SOL_SOCKET, SO_REUSEADDR, &on,
-                 sizeof(on));
-    acceptor_->bind(listen_ep);
+
+    if (cfg_.dual_stack) {
+        // One IPv6 acceptor with V6ONLY=0 serves both families (v4 arrives as
+        // v4-mapped — fine for a byte stream).  If IPv6 is unavailable the
+        // open/bind fails and we fall back to listen_addr (usually v4) with a
+        // loud warning — never silently IPv4-only.  Use the error_code forms:
+        // the throwing open() would crash instead of falling back.
+        asio::error_code ec;
+        acceptor_->open(asio::ip::tcp::v6(), ec);
+        if (!ec) {
+            ::setsockopt(acceptor_->native_handle(), SOL_SOCKET, SO_REUSEADDR,
+                         &on, sizeof(on));
+            int v6only = 0;
+            ::setsockopt(acceptor_->native_handle(), IPPROTO_IPV6, IPV6_V6ONLY,
+                         &v6only, sizeof(v6only));
+            acceptor_->bind(
+                asio::ip::tcp::endpoint(asio::ip::tcp::v6(), cfg_.listen_port),
+                ec);
+        }
+        if (!ec) {
+            spdlog::info("TCP listening on [::]:{} (dual-stack)",
+                         cfg_.listen_port);
+        } else {
+            spdlog::warn("dual_stack: IPv6 TCP bind failed ({}: {}) — "
+                         "TCP is IPv4-only; v6 clients will not connect",
+                         ec.value(), ec.message());
+            acceptor_->close();
+        }
+    }
+
+    if (!acceptor_->is_open()) { // not dual-stack, or dual-stack fell back
+        acceptor_->open(listen_ep.address().is_v6() ? asio::ip::tcp::v6()
+                                                    : asio::ip::tcp::v4());
+        ::setsockopt(acceptor_->native_handle(), SOL_SOCKET, SO_REUSEADDR, &on,
+                     sizeof(on));
+        acceptor_->bind(listen_ep); // hard error on failure (as before)
+    }
     acceptor_->listen();
     accept_loop();
 

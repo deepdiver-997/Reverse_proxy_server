@@ -27,6 +27,12 @@ struct ProxyConfig {
     uint16_t listen_port = 8080;
     int num_threads = 1;
 
+    /// Listen on both IPv4 and IPv6 for the frontends (TCP acceptor binds
+    /// `::` with IPV6_V6ONLY=0; the QUIC demux opens a second IPv6 UDP
+    /// socket).  If IPv6 is unavailable the bind fails and the server logs a
+    /// loud warning and falls back to IPv4-only — it never silently degrades.
+    bool dual_stack = false;
+
     // QUIC (HTTP/3) support — disabled when quic_port == 0.
     uint16_t quic_port = 0;
     std::string quic_cert_file = "certs/cert.pem";

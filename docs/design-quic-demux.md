@@ -152,6 +152,10 @@ recv 到包
 
 短头（1-RTT）包的 DCID 长度**不在包里**，是连接协商值。统一解析必须把 `es_scid_len` 固定成一个值（默认 8），让所有连接的服务端 SCID 等长。长头包自描述，不受影响。
 
+### 6.6 双栈：一个 v4 socket + 一个 v6 socket
+
+`dual_stack = true` 时 demux 持有**两个** UDP socket（v4 + v6，同一端口）。不用"单 v6 socket + V6ONLY=0"的方案，是为了让 v4 流量以**原生 v4 sockaddr** 进 lsquic——v4-mapped（`::ffff:a.b.c.d`）会污染源地址哈希与 CID 路由（§6.1）。代价是双 recv 循环（`do_recv` / `do_recv6`，各自带本地 bound 地址）与发送时按 `dest_sa` 族选 fd（`send_specs` 吃两个 fd）。v6 bind 失败 → 响亮警告 + 回退 v4-only。后端 QUIC client engine 同理持有双 socket，`connect()` 按解析出的对端族选。
+
 ## 7. 入站 vs 出站 QUIC 的不对称
 
 "QUIC 来信需要外部 post"只适用于**入站/前端**一侧：

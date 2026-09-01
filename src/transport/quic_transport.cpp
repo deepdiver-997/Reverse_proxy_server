@@ -783,12 +783,13 @@ int QuicServerEngine::on_packets_out_cb(void* self,
     auto* engine = static_cast<QuicServerEngine*>(self);
     spdlog::debug("QUIC packets_out: {} specs", count);
 
-    // Send synchronously on the demux's shared fd — UDP sendto is thread-safe
-    // (single-datagram atomic).  Return the TRUE sent count (ea_packets_out
-    // contract: lsquic forgets packets we claim sent, so never over-report).
+    // Send synchronously on the demux's shared fds (one per family, picked by
+    // each spec's destination) — UDP sendto is thread-safe (single-datagram
+    // atomic).  Return the TRUE sent count (ea_packets_out contract: lsquic
+    // forgets packets we claim sent, so never over-report).
     bool blocked = false;
-    unsigned sent =
-        send_specs(engine->demux_->native_fd(), specs, count, &blocked);
+    unsigned sent = send_specs(engine->demux_->v4_fd(), engine->demux_->v6_fd(),
+                               specs, count, &blocked);
     if (blocked)
         engine->demux_->notify_tx_blocked();
     return static_cast<int>(sent);
@@ -886,6 +887,7 @@ QuicServerEngine::get_ssl_ctx_cb(void* peer_ctx,
 QuicClientEngine::QuicClientEngine(asio::io_context& io, SslCtxPtr ssl_ctx)
     : io_(io),
       socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0)),
+      socket6_(io),
       tick_timer_(io),
       raw_fd_(socket_.native_handle()),
       ssl_ctx_(std::move(ssl_ctx)) {
@@ -949,8 +951,20 @@ bool QuicClientEngine::connect(const BackendEndpoint& ep) {
     }
     asio::ip::udp::endpoint peer = *results.begin();
 
+    // Use the socket matching the peer's family (a v4 socket can't send to a
+    // v6 address).  The v6 socket is opened lazily on first v6 upstream.
+    asio::ip::udp::socket* sock = &socket_;
+    if (peer.address().is_v6()) {
+        if (!ensure_v6_socket()) {
+            spdlog::warn("QUIC client: no IPv6 socket — cannot reach v6 "
+                         "upstream {}:{}", ep.host, ep.port);
+            return false;
+        }
+        sock = &socket6_;
+    }
+
     struct sockaddr_storage local_sa, peer_sa;
-    to_sockaddr(socket_.local_endpoint(), &local_sa);
+    to_sockaddr(sock->local_endpoint(), &local_sa);
     to_sockaddr(peer, &peer_sa);
 
     // Stash the endpoint so the SYNCHRONOUS on_new_conn (fires inside
@@ -984,28 +998,62 @@ bool QuicClientEngine::connect(const BackendEndpoint& ep) {
 void QuicClientEngine::do_recv() {
     socket_.async_receive_from(
         asio::buffer(recv_buf_), recv_endpoint_,
-        [this](asio::error_code ec, std::size_t n) { on_packet(ec, n); });
+        [this](asio::error_code ec, std::size_t n) { on_packet(ec, n, false); });
 }
 
-void QuicClientEngine::on_packet(asio::error_code ec, std::size_t n) {
+void QuicClientEngine::do_recv6() {
+    socket6_.async_receive_from(
+        asio::buffer(recv6_buf_), recv6_endpoint_,
+        [this](asio::error_code ec, std::size_t n) { on_packet(ec, n, true); });
+}
+
+bool QuicClientEngine::ensure_v6_socket() {
+    if (socket6_.is_open())
+        return true;
+    asio::error_code ec;
+    socket6_.open(asio::ip::udp::v6(), ec);
+    if (!ec)
+        socket6_.bind(asio::ip::udp::endpoint(asio::ip::udp::v6(), 0), ec);
+    if (ec) {
+        spdlog::warn("QUIC client: IPv6 socket open/bind failed ({}: {}) — "
+                     "IPv6 upstreams unavailable", ec.value(), ec.message());
+        socket6_.close();
+        raw6_fd_ = -1;
+        return false;
+    }
+    raw6_fd_ = socket6_.native_handle();
+    do_recv6(); // arm the v6 recv loop before the handshake can produce replies
+    return true;
+}
+
+void QuicClientEngine::on_packet(asio::error_code ec, std::size_t n,
+                                 bool is_v6) {
+    auto& socket = is_v6 ? socket6_ : socket_;
+    auto& recv_buf = is_v6 ? recv6_buf_ : recv_buf_;
+    auto& recv_ep = is_v6 ? recv6_endpoint_ : recv_endpoint_;
+
     if (ec) {
         if (ec == asio::error::operation_aborted)
             return;
         spdlog::warn("QUIC client UDP recv error: {} — re-arming", ec.message());
-        if (socket_.is_open())
-            do_recv();
+        if (socket.is_open()) {
+            if (is_v6)
+                do_recv6();
+            else
+                do_recv();
+        }
         return;
     }
 
     spdlog::debug("QUIC[client] UDP recv {} bytes from {}", n,
-                  recv_endpoint_.address().to_string());
+                  recv_ep.address().to_string());
 
     struct sockaddr_storage local_sa, peer_sa;
-    to_sockaddr(socket_.local_endpoint(), &local_sa);
-    to_sockaddr(recv_endpoint_, &peer_sa);
+    to_sockaddr(socket.local_endpoint(), &local_sa);
+    to_sockaddr(recv_ep, &peer_sa);
 
     int r = lsquic_engine_packet_in(
-        engine_, reinterpret_cast<const unsigned char*>(recv_buf_.data()), n,
+        engine_, reinterpret_cast<const unsigned char*>(recv_buf.data()), n,
         reinterpret_cast<const struct sockaddr*>(&local_sa),
         reinterpret_cast<const struct sockaddr*>(&peer_sa),
         nullptr, 0);
@@ -1014,7 +1062,10 @@ void QuicClientEngine::on_packet(asio::error_code ec, std::size_t n) {
 
     lsquic_engine_process_conns(engine_);
     schedule_tick();
-    do_recv();
+    if (is_v6)
+        do_recv6();
+    else
+        do_recv();
 }
 
 // ── Tick timer ────────────────────────────────────────────
@@ -1067,20 +1118,29 @@ int QuicClientEngine::on_packets_out_cb(void* self,
     auto* engine = static_cast<QuicClientEngine*>(self);
     spdlog::debug("QUIC[client] packets_out: {} specs", count);
     bool blocked = false;
-    unsigned sent = send_specs(engine->raw_fd_, specs, count, &blocked);
+    // Same fd for both families when the v6 socket is absent (raw6_fd_ = -1,
+    // in which case send_specs simply skips v6 specs).
+    unsigned sent =
+        send_specs(engine->raw_fd_, engine->raw6_fd_, specs, count, &blocked);
     if (blocked)
         engine->arm_send_retry();
     return static_cast<int>(sent);
 }
 
 void QuicClientEngine::arm_send_retry() {
-    if (send_retry_armed_ || !socket_.is_open())
+    arm_write_watch(socket_, send_retry_armed_);
+    if (socket6_.is_open())
+        arm_write_watch(socket6_, send_retry6_armed_);
+}
+
+void QuicClientEngine::arm_write_watch(asio::ip::udp::socket& s, bool& armed) {
+    if (armed || !s.is_open())
         return;
-    send_retry_armed_ = true;
-    socket_.async_wait(
+    armed = true;
+    s.async_wait(
         asio::ip::udp::socket::wait_write,
-        [this](asio::error_code ec) {
-            send_retry_armed_ = false;
+        [this, &s, &armed](asio::error_code ec) {
+            armed = false;
             if (ec)
                 return;
             if (engine_)
