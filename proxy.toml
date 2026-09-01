@@ -3,6 +3,9 @@ address = "0.0.0.0"
 port = 8080
 quic_port = 8443
 num_threads = 1
+# Idle timeout (s) per client connection; a silent relay is torn down to free
+# its session/fd/backend port. 0 disables. Default 30.
+idle_timeout = 30
 
 [[backends]]
 id = "app1"

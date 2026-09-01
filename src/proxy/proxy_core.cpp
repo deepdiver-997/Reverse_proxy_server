@@ -12,7 +12,8 @@ ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
     : io_(io),
       h1_codec_(std::make_unique<H1Codec>()),
       h3_codec_(std::make_unique<H3Codec>()),
-      upstream_pool_(io, make_client_ssl_ctx()) {
+      upstream_pool_(io, make_client_ssl_ctx()),
+      idle_timeout_(std::chrono::seconds(cfg.idle_timeout_secs)) {
 
     // Build router.
     for (const auto& r : cfg.routes)
@@ -74,7 +75,7 @@ void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     // or teardown.  It injects router + upstream pool + codecs.
     auto session = std::make_shared<RelaySession>(
         std::move(stream), codec, h1_codec_.get(), h3_codec_.get(), &router_,
-        &upstream_pool_);
+        &upstream_pool_, io_, idle_timeout_);
     live_relays_.insert(session); // pruned when the relay dies / at shutdown
     session->start();
 }

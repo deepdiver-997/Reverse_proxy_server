@@ -5,6 +5,8 @@
 #include "router.h"
 #include "transport/itransport_stream.h"
 #include "upstream_pool.h"
+#include <asio.hpp>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -49,7 +51,8 @@ public:
     /// from the routed endpoint's protocol (TCP → H1, QUIC → H3).
     RelaySession(ITransportStreamPtr client, ICodec* client_codec,
                  ICodec* h1_codec, ICodec* h3_codec, Router* router,
-                 UpstreamPool* pool);
+                 UpstreamPool* pool, asio::io_context& io,
+                 std::chrono::seconds idle_timeout);
 
     /// Begin relaying (enters the Request phase).
     void start();
@@ -88,6 +91,12 @@ private:
     void write_error(HttpStatus status, const std::string& msg);
     void teardown();
 
+    /// (Re-)arm the idle timeout.  No-op when disabled (idle_timeout <= 0) or
+    /// after teardown.  Called at relay-visible activity boundaries (a request
+    /// parsed, a response parsed/written, tunnel traffic, drain reads); when
+    /// the connection is silent for the whole window, fires teardown().
+    void kick_idle_timer();
+
     // Graceful-close plumbing: shutdown_send, then consume the peer's input
     // until EOF so close() (via the stream's destructor) never RSTs.
     void gracefully_close_client();
@@ -124,6 +133,11 @@ private:
     //               instead of looping keep-alive.
     Phase phase_ = Phase::kRequest;
     bool draining_ = false;
+
+    // Idle timeout: one per-connection timer, re-armed on activity.
+    asio::io_context& io_;
+    std::chrono::seconds idle_timeout_;
+    asio::steady_timer idle_timer_;
 };
 
 using RelaySessionPtr = std::shared_ptr<RelaySession>;

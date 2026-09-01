@@ -90,6 +90,15 @@ struct RelaySession : std::enable_shared_from_this<RelaySession> {
 - **四方 codec 已补全**：`H3Codec::async_parse_response`/`async_write_request` 已实现（纯 codec 层）。同时 transport 改为返回**原始解码头列表**（含 pseudo-header），请求/响应的 IR 解释收敛到 codec（`request_head_from_headers`/`response_head_from_headers`），`async_parse_response` 因此复用同一套 QPACK 解码机制。H3 写路径统一剥离 hop-by-hop 头（RFC 9113 §8.1.2.2）。
 - **H3 上游已接通**：QUIC client 引擎 + 连接复用池见 [ADR-9](#adr-9quic-客户端引擎h3-上游)。
 
+### ADR-10：每连接空闲超时（idle timeout）
+
+**背景**：正常运行时读路径无任何超时——对端"沉默但不关"（掉电/断网，无 FIN/RST）时，`request_phase`/`response_phase` 的裸读会**无限挂住**，每条占一个 session + fd + 后端临时端口，无界泄漏（slowloris 同理）。优雅关闭的 `grace` 只覆盖关停场景，管不到正常运行。
+**决策**：RelaySession 持一个 `steady_timer`（`kick_idle_timer()`），在所有 relay 可见的活动边界重置：进入 request_phase（覆盖 keep-alive 空闲窗口）、请求解析完成、后端连上、请求写出、进入/解析响应、隧道双向流量、drain 读。到期 `teardown()`。配置 `listen.idle_timeout`（秒，默认 30，`0` 关闭）。
+**滑动窗口语义**：`expires_after` 对已有 pending 的 wait 会取消之（旧回调以 `operation_aborted` 触发并被吞掉），因此每次重置都是"最后一次活动后 N 秒"，而非"每阶段固定 N 秒"。全生命周期在单 worker 线程，无竞态。
+**粒度边界**：重置点落在 codec 回调边界，codec 内部 body 泵的逐块读写观察不到——所以该超时兼有 idle 与"阶段完成超时"双重语义（超长 body 传输也会触发）。要逐字节重置需把钩子伸进 `pump_body_to_stream`，当前不需要。
+**与优雅关闭的关系**：drain 路径也重置定时器，沉默对端会在 `grace` 之前被 idle 超时提前回收；`teardown()` 里 `cancel()`，保证死亡 session 的定时器不误伤。
+**后果**：任何连接的资源占用都有界；代价是超过阶段时限的慢传输会被中断（demo 可接受，可通过调大 `idle_timeout` 缓解）。
+
 ## 开放问题（需要决策）
 
 ### ① HTTP/3 头处理 ⭐ 已决策

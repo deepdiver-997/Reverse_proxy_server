@@ -27,6 +27,11 @@ struct ProxyConfig {
     uint16_t listen_port = 8080;
     int num_threads = 1;
 
+    /// Idle timeout in seconds for a client connection (0 = disabled).  A
+    /// relay that has been silent for this long is torn down, freeing the
+    /// session / fd / backend port.  Reset on relay-visible activity.
+    int idle_timeout_secs = 30;
+
     /// Listen on both IPv4 and IPv6 for the frontends (TCP acceptor binds
     /// `::` with IPV6_V6ONLY=0; the QUIC demux opens a second IPv6 UDP
     /// socket).  If IPv6 is unavailable the bind fails and the server logs a

@@ -58,6 +58,9 @@ private:
     Router router_;
     UpstreamPool upstream_pool_;
 
+    /// Per-relay idle timeout, forwarded from config (0 = disabled).
+    std::chrono::seconds idle_timeout_ = std::chrono::seconds(30);
+
     /// Live client relays on this worker (weak — a relay removes itself by
     /// dying; expired entries are pruned during graceful_shutdown).  Only ever
     /// touched on this worker's thread.

@@ -9,20 +9,25 @@ namespace ebpf_quic_proxy {
 
 RelaySession::RelaySession(ITransportStreamPtr client, ICodec* client_codec,
                            ICodec* h1_codec, ICodec* h3_codec, Router* router,
-                           UpstreamPool* pool)
+                           UpstreamPool* pool, asio::io_context& io,
+                           std::chrono::seconds idle_timeout)
     : client_(std::move(client)),
       client_codec_(client_codec),
       h1_codec_(h1_codec),
       h3_codec_(h3_codec),
       backend_codec_(h1_codec), // default; use_backend may switch to h3
       router_(router),
-      pool_(pool) {}
+      pool_(pool),
+      io_(io),
+      idle_timeout_(idle_timeout),
+      idle_timer_(io) {}
 
 void RelaySession::start() { request_phase(); }
 
 void RelaySession::request_phase() {
     auto self = shared_from_this();
     goto_phase(Phase::kRequest); // only a read is pending — FIN is safe here
+    kick_idle_timer(); // covers the initial connect + keep-alive idle window
     client_codec_->async_parse_request(
         client_,
         [this, self](asio::error_code ec, HttpRequestHead head,
@@ -42,6 +47,7 @@ void RelaySession::request_phase() {
             // WebSocket / Upgrade: forwarded normally; a 101 response later
             // switches this relay into raw byte-bridge mode.
             request_is_upgrade_ = is_upgrade_request(head);
+            kick_idle_timer(); // request arrived — restart the idle window
 
             spdlog::info("{} {} {} from {}", head.method, head.path,
                          head.headers.get("host").value_or("-"),
@@ -145,6 +151,7 @@ void RelaySession::use_backend(asio::error_code ec,
     }
     backend_ = std::move(upstream);
     backend_endpoint_ = endpoint;
+    kick_idle_timer(); // backend connected — waiting on connect is bounded too
     // Pick the backend codec from the endpoint's protocol: QUIC upstream
     // speaks HTTP/3, TCP speaks HTTP/1.1.
     backend_codec_ =
@@ -247,6 +254,7 @@ void RelaySession::pump_bytes(ITransportStreamPtr src, ITransportStreamPtr dst) 
                 teardown();
                 return;
             }
+            kick_idle_timer(); // tunnel traffic (read direction)
             dst->async_write_some(
                 asio::buffer(buf->data(), n),
                 [this, self, src, dst, buf](asio::error_code ec,
@@ -257,6 +265,7 @@ void RelaySession::pump_bytes(ITransportStreamPtr src, ITransportStreamPtr dst) 
                         teardown();
                         return;
                     }
+                    kick_idle_timer(); // tunnel traffic (write direction)
                     pump_bytes(src, dst); // continue pumping
                 });
         });
@@ -284,6 +293,7 @@ void RelaySession::send_backend_request(bool retry_allowed) {
             }
             pending_head_.reset();
             pending_body_.reset();
+            kick_idle_timer(); // request written to backend
             spdlog::debug("relay: backend request written");
             response_phase();
         });
@@ -309,6 +319,7 @@ void RelaySession::reconnect_backend_fresh() {
 
 void RelaySession::response_phase() {
     goto_phase(Phase::kResponse);
+    kick_idle_timer(); // awaiting the backend response
     auto self = shared_from_this();
     backend_codec_->async_parse_response(
         backend_,
@@ -333,6 +344,7 @@ void RelaySession::response_phase() {
             // preserves it; H3 write ignores it.
             if (!client_version_.empty())
                 resp.version = client_version_;
+            kick_idle_timer(); // backend responded
 
             // 101 Switching Protocols: the backend accepted an Upgrade (e.g.
             // WebSocket).  Hand off the 101 (which has no body), then switch
@@ -471,7 +483,29 @@ void RelaySession::drain_client() {
                 teardown();
                 return;
             }
+            kick_idle_timer(); // draining still active
             drain_client(); // keep consuming until EOF
+        });
+}
+
+// ── Idle timeout ──────────────────────────────────────────
+
+void RelaySession::kick_idle_timer() {
+    if (done_ || idle_timeout_.count() <= 0)
+        return;
+    // Re-arming cancels the previous wait (its handler fires with
+    // operation_aborted and returns).  Reset on every relay-visible activity;
+    // note the codec's internal body-pump reads/writes are not observed here,
+    // so this is effectively a per-phase completion timeout as well as an
+    // idle timeout for silent connections.
+    idle_timer_.expires_after(idle_timeout_);
+    idle_timer_.async_wait(
+        [this, self = shared_from_this()](asio::error_code ec) {
+            if (ec) // re-armed or cancelled — not a timeout
+                return;
+            spdlog::warn("relay: idle timeout ({}s) on {}",
+                         idle_timeout_.count(), client_->stream_id());
+            teardown();
         });
 }
 
@@ -479,6 +513,7 @@ void RelaySession::teardown() {
     if (done_)
         return;
     done_ = true;
+    idle_timer_.cancel(); // no timeout should fire after teardown
     goto_phase(Phase::kClosed);
     spdlog::debug("relay: tearing down {}", client_->stream_id());
     client_->async_shutdown([](asio::error_code) {});

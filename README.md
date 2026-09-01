@@ -100,6 +100,7 @@ address       = "0.0.0.0"
 port          = 8080
 num_threads   = 4            # worker 数：1 ingress + N worker
 dual_stack    = true         # 前端同时监听 IPv4 + IPv6（见下）
+idle_timeout  = 30           # 连接空闲超时（秒）；0 = 关闭
 quic_port     = 8443         # QUIC UDP 端口；0 = 关闭 QUIC
 quic_cert_file = "certs/cert.pem"
 quic_key_file  = "certs/key.pem"
@@ -126,6 +127,7 @@ backend = "api"             # 兜底路由
 | `listen.port` | `8080` | TCP/HTTP/1.1 端口 |
 | `listen.num_threads` | `1` | **worker 数**：总线程 = `num_threads` + 1（ingress）。每 worker = 一条 io_context 线程，host 前端 + QUIC 引擎 + relay + 私有后端池 |
 | `listen.dual_stack` | `false` | 前端同时监听 IPv4 + IPv6：TCP acceptor 绑 `::` + `IPV6_V6ONLY=0`，QUIC demux 多开一个 v6 UDP socket（双 socket，v4 不做 v4-mapped）。IPv6 不可用时**响亮警告并回退 IPv4-only**（不静默）。后端侧 TCP 已双栈（resolver），QUIC 上游按解析结果族自动选 socket |
+| `listen.idle_timeout` | `30` | 单连接空闲超时（秒，`0` 关闭）。relay 在最后一次活动后 N 秒无活动即 teardown，释放 session/fd/后端端口；在请求解析/响应/隧道流量等阶段边界重置（滑动窗口，见 ADR-10） |
 | `listen.quic_port` | `0` | QUIC UDP 端口（ingress 共享 socket），`0` 关闭 QUIC |
 | `listen.quic_cert_file` / `quic_key_file` | `certs/cert.pem` / `key.pem` | QUIC TLS 证书（所有 worker 共享同一只读 ctx） |
 | `backends[].id/host/port/weight` | — | 后端端点 |
@@ -144,6 +146,7 @@ cmake --build build --target proxy_tests -j
 - [架构](docs/architecture.md) — 组件、分层、数据流
 - [传输层深入](docs/transport.md) — UDP/QUIC/lsquic 驱动模型、并发与所有权
 - [RelaySession 相位机](docs/relay-session.md) — 核心状态机逐相位详解（含"隐式状态 vs 显式 enum/跳转表"讨论）
+- [HTTP/1.1 语义速查](docs/http-primer.md) — 标准知识 ↔ codec 代码行号对照，读 H1Codec 的入口
 - [QUIC demux 设计蓝图](docs/design-quic-demux.md) — Model A：统一单入口 + co-located worker、CID 路由、发送契约、优雅关闭
 - [单 ingress 收包优化设计](docs/ingress-dispatch.md) — QUIC 入站开销分解（二次拷贝/堆分配/post 唤醒）+ 缓冲池/批量/多线程分发方案
 - [设计决策与开放问题](docs/design-decisions.md) — ADR（含 H3 codec 路线 B / lsquic 原生 QPACK）
