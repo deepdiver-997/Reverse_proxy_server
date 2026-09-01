@@ -145,6 +145,7 @@ cmake --build build --target proxy_tests -j
 - [传输层深入](docs/transport.md) — UDP/QUIC/lsquic 驱动模型、并发与所有权
 - [RelaySession 相位机](docs/relay-session.md) — 核心状态机逐相位详解（含"隐式状态 vs 显式 enum/跳转表"讨论）
 - [QUIC demux 设计蓝图](docs/design-quic-demux.md) — Model A：统一单入口 + co-located worker、CID 路由、发送契约、优雅关闭
+- [单 ingress 收包优化设计](docs/ingress-dispatch.md) — QUIC 入站开销分解（二次拷贝/堆分配/post 唤醒）+ 缓冲池/批量/多线程分发方案
 - [设计决策与开放问题](docs/design-decisions.md) — ADR（含 H3 codec 路线 B / lsquic 原生 QPACK）
 - [CI 规范](docs/ci.md) — 构建链顺序、验证清单、平台差异、third_party 拉取约束
 - [lsquic 握手互操作报告](docs/lsquic-handshake-bug-report.md) — 三个缺陷定位 + 验证修复（upstream issue #680 草稿）
