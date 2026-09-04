@@ -137,6 +137,8 @@ static void on_conn_closed(lsquic_conn_t*) {
 static lsquic_stream_ctx_t* on_new_stream(void*, lsquic_stream_t* s) {
     auto* sc = new StreamCtx();
     lsquic_stream_set_ctx(s, reinterpret_cast<lsquic_stream_ctx_t*>(sc));
+    lsquic_stream_wantread(s, 1);   // streams start read-disabled; without
+                                    // this on_read never fires
     printf("[LOG] new stream %llu\n", (unsigned long long)lsquic_stream_id(s));
     fflush(stdout);
     return reinterpret_cast<lsquic_stream_ctx_t*>(sc);

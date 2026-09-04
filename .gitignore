@@ -12,5 +12,6 @@ cmake-build-*/
 .DS_Store
 .gitignore
 docs/crash_report.md
+docs/local/
 # third_party/ is gitlink submodules (see .gitmodules)
 third_party/*/build/

@@ -2,11 +2,14 @@
 # ensure_lsquic_patch.sh — guard the vendored lsquic build against silently
 # losing the A+B HTTP/3 interop patch.
 #
-# The patch (docs/lsquic-4.7.0-http3-interop-a-b.patch) fixes two upstream
-# defects that break the H3 handshake with strict clients (curl/ngtcp2):
+# The patch (docs/lsquic-4.7.0-http3-interop-a-b.patch) fixes three upstream
+# defects that break the H3 path with strict clients (curl/ngtcp2):
 #   A) no-SNI → CERT_CB_ERROR  (iquic_lookup_cert in lsquic_enc_sess_ietf.c)
 #   B) ack-eliciting Initial not padded to 1200 bytes, RFC 9000 §14.1
 #      (lsquic_mini_conn_ietf.c)
+#   C) CRYPTO-frame stash ceiling 10 < ngtcp2 "chaos protection" ~20 shuffled
+#      frames → handshake starves (IMICO_MAX_STASHED_FRAMES in
+#      lsquic_mini_conn_ietf.h); upstream lsquic#680, confirmed 2026-09-05
 #
 # third_party/ is gitignored, so a fresh `git submodule update` or checkout
 # silently reverts the patch and the H3 path breaks again.  This hook
@@ -26,6 +29,7 @@ LIB="$LSQUIC/build/src/liblsquic/liblsquic.a"
 PATCHED_SRC=(
   "$LSQUIC/src/liblsquic/lsquic_enc_sess_ietf.c"
   "$LSQUIC/src/liblsquic/lsquic_mini_conn_ietf.c"
+  "$LSQUIC/src/liblsquic/lsquic_mini_conn_ietf.h"
 )
 
 [ -f "$PATCH" ] || { echo "FATAL: patch not found: $PATCH" >&2; exit 1; }

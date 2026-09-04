@@ -60,3 +60,16 @@ index 9719516..53a056c 100644
          }
          packet_size = lsquic_packet_out_total_sz(lconn, packet_out);
          if (!(to_coal
+diff --git a/src/liblsquic/lsquic_mini_conn_ietf.h b/src/liblsquic/lsquic_mini_conn_ietf.h
+index 9b1fffb..c633109 100644
+--- a/src/liblsquic/lsquic_mini_conn_ietf.h
++++ b/src/liblsquic/lsquic_mini_conn_ietf.h
+@@ -113,7 +113,7 @@ struct ietf_mini_conn
+ #define IMICO_MAX_DELAYED_PACKETS_UNVALIDATED 1u
+ #define IMICO_MAX_DELAYED_PACKETS_VALIDATED 2u
+     unsigned char                   imc_delayed_packets_count;
+-#define IMICO_MAX_STASHED_FRAMES 10u
++#define IMICO_MAX_STASHED_FRAMES 20u
+     unsigned char                   imc_n_crypto_frames;
+     unsigned short                  imc_hello_pkt_remain;
+     unsigned char                   imc_long_header_sz;
