@@ -222,7 +222,7 @@ public:
     /// `demux` is the shared QUIC ingress: we send on its fd, and register /
     /// unregister our server SCIDs with it so inbound packets route here.
     QuicServerEngine(asio::io_context& io, SslCtxPtr ssl_ctx,
-                     QuicPacketDemux* demux);
+                     QuicPacketDemux* demux, unsigned max_streams_in = 0);
     ~QuicServerEngine();
 
     QuicServerEngine(const QuicServerEngine&) = delete;

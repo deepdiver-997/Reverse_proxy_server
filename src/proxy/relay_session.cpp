@@ -417,10 +417,17 @@ void RelaySession::after_client_response() {
         gracefully_close_client();
         return;
     }
-    if (client_keep_alive_ && !done_)
+    // H1 keep-alive: the same connection carries the next request.  H3: one
+    // exchange per stream — read the stream to EOF (lsquic releases the
+    // stream, returning the peer-stream slot, only once both directions are
+    // drained) and then FIN; otherwise slots accumulate until the idle
+    // timeout and the connection dies after ~es_max_streams_in requests.
+    if (client_keep_alive_ && !done_ && client_codec_ == h1_codec_)
         request_phase();
+    else if (client_codec_ == h1_codec_)
+        gracefully_close_client();
     else
-        teardown();
+        drain_client();
 }
 
 void RelaySession::write_error(HttpStatus status, const std::string& msg) {

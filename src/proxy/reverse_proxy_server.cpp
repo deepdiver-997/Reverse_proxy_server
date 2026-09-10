@@ -59,7 +59,8 @@ void ReverseProxyServer::start() {
         cores_.push_back(
             std::make_unique<ProxyCore>(*worker_ios_[i], cfg_, &stats_));
         if (cfg_.quic_port > 0 && server_ssl_)
-            cores_[i]->start_quic(demux_.get(), server_ssl_);
+            cores_[i]->start_quic(demux_.get(), server_ssl_,
+                                  (unsigned) cfg_.max_streams_in);
     }
 
     // TCP ingress: accept → hand the fd to a worker (round-robin).

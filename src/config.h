@@ -30,6 +30,12 @@ struct ProxyConfig {
     /// Prometheus-style stats listener port (127.0.0.1 only).  0 = disabled.
     uint16_t stats_port = 0;
 
+    /// MAX_STREAMS credit advertised to H3 clients per connection (lsquic
+    /// es_max_streams_in).  lsquic's default (100) lets a keep-alive client
+    /// issue only ~100 requests per connection before stalling; raise for
+    /// long-lived H3 connections.  0 = lsquic default.
+    int max_streams_in = 0;
+
     /// Idle timeout in seconds for a client connection (0 = disabled).  A
     /// relay that has been silent for this long is torn down, freeing the
     /// session / fd / backend port.  Reset on relay-visible activity.

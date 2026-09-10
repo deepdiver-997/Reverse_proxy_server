@@ -49,3 +49,34 @@ macOS arm64（darwin 24.6），环回 UDP/TCP，`num_threads = 1`，
 - 下一步（路线图 Phase 2/3，见 README / 本目录）：多核 ingress
   （SO_REUSEPORT + BPF DCID steering）、egress 批量 + 缓冲池。做之前先换一个
   更强的压测源（h2load h3 版或自写 h3 loadgen），并把后端换成非阻塞 echo。
+
+## 重大发现：H3 keep-alive 在默认配置下每连接 ~100 请求即饿死（2026-09-11）
+
+现象：每连接恰好 100 条响应后 stall，30s idle 后被代理回收（曾误判为噪声/环境问题）。
+两层原因：
+
+1. **lsquic 传输参数只授初始信用**：TP 里广播的 `init_max_streams_bidi` 来自
+   `es_init_max_streams_bidi`（默认 100），与 `es_max_streams_in` 是两个独立设置。
+   只调 `es_max_streams_in` 不改变初始信用。
+2. **relay 对 H3 流不关闭**：`after_client_response()` 对 h3 也走 H1 的
+   keep-alive 逻辑（在已 FIN 的流上等下一个请求），流对象挂到 30s idle 超时，
+   服务器侧流槽位被占满后 lsquic 丢弃新流帧。
+
+修复：a) `after_client_response` 对 h3 改为 drain-to-EOF + teardown（每流一发即关）；
+b) 新增 `proxy.toml max_streams_in`（同时设 `es_init_max_streams_bidi` 与
+`es_max_streams_in`，默认 0 = lsquic 原值 100；基准/生产建议 1000+）。
+
+效果（10 conn × -w 4，asyncio 后端）：修复前 100 req/36.6s（2.7 rps）→
+修复后 **5000 req/2.29s（≈2185 rps）**。
+
+注意：debug 级 lsquic 日志本身会让吞吐降 ~3.7 倍（8.5s vs 2.3s）——压测时必须
+关闭（`enable-lsquic-info-log.patch` 仅用于诊断）。
+
+## 历次基线（修订）
+
+| 日期 | 配置 | 结果 | 备注 |
+|---|---|---|---|
+| 2026-09-11 修复前 | 10 conn / w4 / 5000 req | 100 req 后 stall（2.7 rps） | MAX_STREAMS 初始信用 + h3 流不关闭 |
+| 2026-09-11 修复后 | 10 conn / w4 / 5000 req | **2185 rps**，全部 200 | asyncio 后端 |
+| 2026-09-11 修复后 | 50 conn / w8 / 20000 req | ~86 rps | 多连接反而劣化——待查（ingress 单线程 / 客户端 50 连接事件循环），Phase 2 入口 |
+

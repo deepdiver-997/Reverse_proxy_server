@@ -1,4 +1,5 @@
 #include "quic_transport.h"
+
 extern "C" {
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -640,7 +641,8 @@ static const struct lsquic_stream_if kClientStreamIf = {
 // ═══════════════════════════════════════════════════════════
 
 QuicServerEngine::QuicServerEngine(asio::io_context& io, SslCtxPtr ssl_ctx,
-                                   QuicPacketDemux* demux)
+                                   QuicPacketDemux* demux,
+                                   unsigned max_streams_in)
     : io_(io),
       tick_timer_(io),
       ssl_ctx_(std::move(ssl_ctx)),
@@ -668,6 +670,15 @@ QuicServerEngine::QuicServerEngine(asio::io_context& io, SslCtxPtr ssl_ctx,
     struct lsquic_engine_settings settings;
     lsquic_engine_init_settings(&settings, LSENG_SERVER | LSENG_HTTP);
     settings.es_scid_len = kServerCidLen;
+    if (max_streams_in > 0)
+    {
+        // BOTH matter: init_* is what the transport parameters advertise
+        // (initial client credit); max_streams_in is the replenishment
+        // ceiling.  Setting only one leaves keep-alive clients stalled at
+        // ~100 requests per connection.
+        settings.es_init_max_streams_bidi = max_streams_in;
+        settings.es_max_streams_in        = max_streams_in;
+    }
     api.ea_settings = &settings;
 
     unsigned flags = LSENG_SERVER | LSENG_HTTP;

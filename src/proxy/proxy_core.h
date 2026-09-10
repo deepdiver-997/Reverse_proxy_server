@@ -34,7 +34,8 @@ public:
     /// Create the QUIC server engine (no socket — it is fed by the demux) and
     /// register this worker with the demux.  `ssl_ctx` is the shared server
     /// TLS context, created once in main.
-    void start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx);
+    void start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx,
+                    unsigned max_streams_in);
 
     /// Graceful shutdown (server stopping): FIN + drain every live frontend
     /// connection on this worker, and GOAWAY every live QUIC server connection.

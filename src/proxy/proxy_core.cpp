@@ -38,9 +38,10 @@ void ProxyCore::on_new_tcp_socket(asio::ip::tcp::socket socket) {
     on_session(std::move(session));
 }
 
-void ProxyCore::start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx) {
-    quic_engine_ =
-        std::make_unique<QuicServerEngine>(io_, std::move(ssl_ctx), demux);
+void ProxyCore::start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx,
+                           unsigned max_streams_in) {
+    quic_engine_ = std::make_unique<QuicServerEngine>(
+        io_, std::move(ssl_ctx), demux, max_streams_in);
 
     int worker_idx = demux->add_worker(io_, quic_engine_.get());
     quic_engine_->set_worker_idx(worker_idx);
