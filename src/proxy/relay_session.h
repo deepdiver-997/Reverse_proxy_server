@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stats.h"
+
 #include "codec/icodec.h"
 #include "config.h"
 #include "router.h"
@@ -52,7 +54,7 @@ public:
     RelaySession(ITransportStreamPtr client, ICodec* client_codec,
                  ICodec* h1_codec, ICodec* h3_codec, Router* router,
                  UpstreamPool* pool, asio::io_context& io,
-                 std::chrono::seconds idle_timeout);
+                 std::chrono::seconds idle_timeout, ProxyStats* stats);
 
     /// Begin relaying (enters the Request phase).
     void start();
@@ -137,6 +139,8 @@ private:
     // Idle timeout: one per-connection timer, re-armed on activity.
     asio::io_context& io_;
     std::chrono::seconds idle_timeout_;
+    ProxyStats* stats_ = nullptr;
+    std::chrono::steady_clock::time_point exchange_start_;
     asio::steady_timer idle_timer_;
 };
 

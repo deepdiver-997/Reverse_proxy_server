@@ -8,6 +8,7 @@
 #include "transport/itransport_stream.h"
 #include "transport/quic_transport.h"
 #include "upstream_pool.h"
+#include "stats.h"
 #include <asio.hpp>
 #include <memory>
 #include <set>
@@ -23,7 +24,8 @@ class RelaySession; // fwd — live_relays_ holds weak refs to these
 /// relay — runs on this one thread (co-located, zero cross-thread marshaling).
 class ProxyCore {
 public:
-    ProxyCore(asio::io_context& io, const ProxyConfig& cfg);
+    ProxyCore(asio::io_context& io, const ProxyConfig& cfg,
+              ProxyStats* stats);
 
     /// Accept a TCP connection handed over by the ingress thread.  Runs on
     /// this worker's thread (posted here by the ingress).
@@ -56,6 +58,7 @@ private:
     std::unique_ptr<ICodec> h1_codec_;
     std::unique_ptr<ICodec> h3_codec_;
     Router router_;
+    ProxyStats* stats_ = nullptr;
     UpstreamPool upstream_pool_;
 
     /// Per-relay idle timeout, forwarded from config (0 = disabled).

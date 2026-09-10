@@ -27,6 +27,9 @@ struct ProxyConfig {
     uint16_t listen_port = 8080;
     int num_threads = 1;
 
+    /// Prometheus-style stats listener port (127.0.0.1 only).  0 = disabled.
+    uint16_t stats_port = 0;
+
     /// Idle timeout in seconds for a client connection (0 = disabled).  A
     /// relay that has been silent for this long is torn down, freeing the
     /// session / fd / backend port.  Reset on relay-visible activity.

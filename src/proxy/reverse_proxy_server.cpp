@@ -56,7 +56,8 @@ void ReverseProxyServer::start() {
     // Workers.
     cores_.reserve(n_);
     for (int i = 0; i < n_; ++i) {
-        cores_.push_back(std::make_unique<ProxyCore>(*worker_ios_[i], cfg_));
+        cores_.push_back(
+            std::make_unique<ProxyCore>(*worker_ios_[i], cfg_, &stats_));
         if (cfg_.quic_port > 0 && server_ssl_)
             cores_[i]->start_quic(demux_.get(), server_ssl_);
     }
@@ -105,6 +106,20 @@ void ReverseProxyServer::start() {
     }
     acceptor_->listen();
     accept_loop();
+
+    // Stats listener (127.0.0.1 only): one-shot GET → counters → close.
+    if (cfg_.stats_port > 0) {
+        stats_acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(*ingress_io_);
+        stats_acceptor_->open(asio::ip::tcp::v4());
+        int on = 1;
+        ::setsockopt(stats_acceptor_->native_handle(), SOL_SOCKET, SO_REUSEADDR,
+                     &on, sizeof(on));
+        stats_acceptor_->bind(asio::ip::tcp::endpoint(
+            asio::ip::address_v4::loopback(), cfg_.stats_port));
+        stats_acceptor_->listen();
+        stats_accept_loop();
+        spdlog::info("stats listening on 127.0.0.1:{}", cfg_.stats_port);
+    }
 
     grace_timer_ = std::make_unique<asio::steady_timer>(*ingress_io_);
 
@@ -205,6 +220,38 @@ void ReverseProxyServer::hard_stop() {
     ingress_io_->stop();
     for (auto& io : worker_ios_)
         io->stop();
+}
+
+
+void ReverseProxyServer::stats_accept_loop() {
+    stats_acceptor_->async_accept(
+        [this](asio::error_code ec, asio::ip::tcp::socket socket) {
+            if (stopping_.load())
+                return; // shutdown: do not re-arm; io_context is being stopped
+            if (!ec) {
+                auto buf = std::make_shared<std::array<char, 4096>>();
+                auto sock =
+                    std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+                sock->async_read_some(
+                    asio::buffer(*buf),
+                    [this, sock, buf](asio::error_code, std::size_t) {
+                        const std::string body = stats_.render();
+                        const std::string resp =
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain; version=0.0.4\r\n"
+                            "Connection: close\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\n\r\n" + body;
+                        asio::async_write(
+                            *sock, asio::buffer(resp),
+                            [sock](asio::error_code, std::size_t) {
+                                asio::error_code ign;
+                                sock->shutdown(
+                                    asio::ip::tcp::socket::shutdown_send, ign);
+                            });
+                    });
+            }
+            stats_accept_loop(); // re-arm
+        });
 }
 
 } // namespace ebpf_quic_proxy

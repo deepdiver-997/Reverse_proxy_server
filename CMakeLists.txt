@@ -46,6 +46,7 @@ add_executable(ebpf-quic-proxy
     src/proxy/upstream_pool.cpp
     src/proxy/proxy_core.cpp
     src/proxy/relay_session.cpp
+    src/proxy/stats.cpp
     src/proxy/reverse_proxy_server.cpp
 )
 

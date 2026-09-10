@@ -10,7 +10,8 @@ namespace ebpf_quic_proxy {
 RelaySession::RelaySession(ITransportStreamPtr client, ICodec* client_codec,
                            ICodec* h1_codec, ICodec* h3_codec, Router* router,
                            UpstreamPool* pool, asio::io_context& io,
-                           std::chrono::seconds idle_timeout)
+                           std::chrono::seconds idle_timeout,
+                           ProxyStats* stats)
     : client_(std::move(client)),
       client_codec_(client_codec),
       h1_codec_(h1_codec),
@@ -20,6 +21,7 @@ RelaySession::RelaySession(ITransportStreamPtr client, ICodec* client_codec,
       pool_(pool),
       io_(io),
       idle_timeout_(idle_timeout),
+      stats_(stats),
       idle_timer_(io) {}
 
 void RelaySession::start() { request_phase(); }
@@ -41,6 +43,8 @@ void RelaySession::request_phase() {
                 return;
             }
             goto_phase(Phase::kForward); // an exchange is beginning — no more FIN
+            exchange_start_ = std::chrono::steady_clock::now();
+            ++stats_->requests;
             client_keep_alive_ = keep_alive;
             request_method_ = head.method;
             client_version_ = head.version; // echo the client's wire version
@@ -157,6 +161,8 @@ void RelaySession::use_backend(asio::error_code ec,
     backend_codec_ =
         (endpoint.protocol == TransportProtocol::QUIC) ? h3_codec_ : h1_codec_;
     backend_from_pool_ = from_pool;
+    if (!from_pool)
+        ++stats_->backend_connects;
     spdlog::debug("relay: backend connected {}:{} (from_pool={}, proto={})",
                   endpoint.host, endpoint.port, from_pool,
                   endpoint.protocol == TransportProtocol::QUIC ? "h3" : "h1");
@@ -313,6 +319,7 @@ void RelaySession::reconnect_backend_fresh() {
             backend_ = std::move(upstream);
             backend_endpoint_ = endpoint;
             backend_from_pool_ = false;
+            ++stats_->backend_connects;
             send_backend_request(/*retry_allowed=*/false); // one retry only
         });
 }
@@ -339,6 +346,11 @@ void RelaySession::response_phase() {
 
             spdlog::debug("relay: backend response {} {}", resp.status_code,
                           resp.reason);
+            if (resp.status_code >= 400)
+                ++stats_->resp_err;
+            else
+                ++stats_->resp_ok;
+            stats_->record_latency(exchange_start_);
             // Re-serialize the status line with the CLIENT's version (the
             // backend's version described the backend connection).  H1 write
             // preserves it; H3 write ignores it.
@@ -412,6 +424,7 @@ void RelaySession::after_client_response() {
 }
 
 void RelaySession::write_error(HttpStatus status, const std::string& msg) {
+    ++stats_->resp_err; // every locally-generated error surfaces to a client
     auto self = shared_from_this();
     HttpResponseHead resp;
     resp.status_code = static_cast<int>(status);

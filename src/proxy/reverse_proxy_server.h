@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include "proxy/stats.h"
 #include "transport/quic_demux.h"
 #include "transport/quic_transport.h"
 #include <asio.hpp>
@@ -58,6 +59,7 @@ public:
 
 private:
     void accept_loop();
+    void stats_accept_loop();   // GET-only metrics listener (127.0.0.1)
     void begin_shutdown();   // runs on the ingress thread (posted from stop())
     void finalize();         // after grace: force QUIC CONNECTION_CLOSE + beat
     void hard_stop();        // stop every io_context — ends the run() loops
@@ -77,6 +79,8 @@ private:
         worker_guards_;
 
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor_;
+    std::unique_ptr<asio::ip::tcp::acceptor> stats_acceptor_;
+    ProxyStats stats_;
     std::unique_ptr<asio::steady_timer> grace_timer_;
     std::unique_ptr<asio::signal_set> signals_;
     std::size_t rr_ = 0; // round-robin worker pick for accepted fds

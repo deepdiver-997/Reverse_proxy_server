@@ -19,6 +19,8 @@ ProxyConfig load_config(const std::string& path) {
                 toml::find_or<int>(tbl, "port", 8080);
             cfg.num_threads =
                 toml::find_or<int>(tbl, "num_threads", 1);
+            cfg.stats_port =
+                static_cast<uint16_t>(toml::find_or<int>(tbl, "stats_port", 0));
             cfg.idle_timeout_secs =
                 toml::find_or<int>(tbl, "idle_timeout", 30);
             cfg.dual_stack =

@@ -8,8 +8,10 @@
 namespace ebpf_quic_proxy {
 
 
-ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
+ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg,
+                     ProxyStats* stats)
     : io_(io),
+      stats_(stats),
       h1_codec_(std::make_unique<H1Codec>()),
       h3_codec_(std::make_unique<H3Codec>()),
       upstream_pool_(io, make_client_ssl_ctx()),
@@ -30,6 +32,7 @@ ProxyCore::ProxyCore(asio::io_context& io, const ProxyConfig& cfg)
 }
 
 void ProxyCore::on_new_tcp_socket(asio::ip::tcp::socket socket) {
+    ++stats_->tcp_conns;
     auto session = std::make_shared<TcpTransportSession>(std::move(socket));
     spdlog::debug("new session from {}", session->remote_addr());
     on_session(std::move(session));
@@ -44,6 +47,7 @@ void ProxyCore::start_quic(QuicPacketDemux* demux, SslCtxPtr ssl_ctx) {
 
     quic_engine_->set_new_session_cb(
         [this](QuicTransportSessionPtr session) {
+            ++stats_->quic_conns;
             spdlog::debug("new QUIC session from {}", session->remote_addr());
             on_session(std::move(session));
         });
@@ -75,7 +79,7 @@ void ProxyCore::on_stream(ITransportStreamPtr stream, ICodec* codec) {
     // or teardown.  It injects router + upstream pool + codecs.
     auto session = std::make_shared<RelaySession>(
         std::move(stream), codec, h1_codec_.get(), h3_codec_.get(), &router_,
-        &upstream_pool_, io_, idle_timeout_);
+        &upstream_pool_, io_, idle_timeout_, stats_);
     live_relays_.insert(session); // pruned when the relay dies / at shutdown
     session->start();
 }
