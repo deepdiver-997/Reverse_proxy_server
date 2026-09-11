@@ -80,3 +80,16 @@ b) 新增 `proxy.toml max_streams_in`（同时设 `es_init_max_streams_bidi` 与
 | 2026-09-11 修复后 | 10 conn / w4 / 5000 req | **2185 rps**，全部 200 | asyncio 后端 |
 | 2026-09-11 修复后 | 50 conn / w8 / 20000 req | ~86 rps | 多连接反而劣化——待查（ingress 单线程 / 客户端 50 连接事件循环），Phase 2 入口 |
 
+
+## 50 连接劣化归因（2026-09-11）
+
+50 conn × w8 时吞吐降至 ~86 rps。归因实验：
+
+- 压测期间采样 CPU：**代理进程 100%（单核饱和）**，客户端 1%，后端 0.1%
+  → 不是客户端问题，无需改客户端。
+- `sample` 热点栈：worker 线程 `lsquic_engine_process_conns` +
+  `lsquic_stream_dispatch_read_events`（relay/H3 处理本身）；ingress demux
+  占比很小。
+- 结论：**单 worker 打满**。num_threads>1 在当前 src-IP 哈希下对环回无效
+  （同 IP 全落 worker 0）——这正是 Phase 2 要解决的，见
+  docs/design-multi-ingress.md（路由字节 CID 方案）。
