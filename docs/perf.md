@@ -104,3 +104,19 @@ b) 新增 `proxy.toml max_streams_in`（同时设 `es_init_max_streams_bidi` 与
 实施：`ea_generate_scid` 产出 SCID[0]=worker idx；demux 未知 CID 先查路由字节、
 否则按 DCID 字节哈希（替换原 src-IP 哈希，解除环回/同 NAT 倾斜）。零错误。
 NT=1 的非线性劣化与 50 连接下的客户端行为待深入；NT≥2 后悬崖消失。
+
+## 高并发劣化定案 + 多进程客户端（2026-09-11）
+
+隔离矩阵（NT=1）：rps ≈ 86000 / 并发流数（40→2144，200→419，400→211；连接数
+本身也是减分项）。CPU 采样：worker 100%、客户端 1%。热点
+`lsquic_engine_process_conns`/`dispatch_read_events`——lsquic 每 tick 轮询全部
+活跃流，O(活跃流数)/tick，应用层无解。
+
+**运营准则**：每 worker 并发流 ≤ ~40 保持 ≥2000 rps/worker；横向扩 worker
+（Phase 2a 路由字节已支持）按比例恢复吞吐。
+
+`bench.sh` 新增第 5 参数 PROCS（并行客户端进程数），消除单进程客户端上限。
+
+| 日期 | 配置 | 结果 |
+|---|---|---|
+| 2026-09-11 | NT=4，4 客户端进程 × (10 conn × w4)，20000 req | **~4430 rps**，0 错误 |
