@@ -120,3 +120,21 @@ NT=1 的非线性劣化与 50 连接下的客户端行为待深入；NT≥2 后�
 | 日期 | 配置 | 结果 |
 |---|---|---|
 | 2026-09-11 | NT=4，4 客户端进程 × (10 conn × w4)，20000 req | **~4430 rps**，0 错误 |
+
+## 待查：lsquic_stream_close() 会丢弃缓冲响应（2026-09-11）
+
+理论上更正确的 `lsquic_stream_close()`（flush+FIN+释放流槽位，可让 MAX_STREAMS
+信用归还）在我们的 relay 上下文里导致**响应永远不到达客户端**（flush 前置也无效，
+客户端 0 完成，且不再发后续请求）。已回退为 `lsquic_stream_shutdown(SHUT_WR)`：
+响应投递可靠，代价是流对象滞留至 idle 超时、流信用不归还 → keep-alive 客户端
+每连接上限 ≈ `max_streams_in`（当前配置 1000）。
+
+怀疑与异步写完成语义（write 回调 ≠ 数据出包）及 drain/close 时序有关。
+**Phase 2b 在 Linux 容器里用 Debug 构建重查**（Release 下 LSQ_DEBUG 被编译掉，
+无法观测）。
+
+## 当前基线（max_streams_in=1000 + SHUT_WR）
+
+| 配置 | 结果 |
+|---|---|
+| 10 conn × w4 / 5000 req | 5000/5000，0.80s ≈ **6250 rps** |

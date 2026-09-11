@@ -60,15 +60,23 @@ void QuicTransportStream::async_write_some(asio::const_buffer buf,
 
 void QuicTransportStream::async_shutdown(ShutdownCallback cb) {
     shutdown_cb_ = std::move(cb);
+    // NOTE: lsquic_stream_shutdown(SHUT_WR) is deliberate.  Do NOT "upgrade"
+    // this to lsquic_stream_close() — from our relay context the buffered
+    // response is then never delivered (client sees nothing, 0 completed
+    // requests; flush-before-close does not help either, see docs/perf.md).
+    // Cost of SHUT_WR: the stream object lingers until the idle timeout, so
+    // peer-stream credit does not return — keep-alive clients are limited to
+    // ~es_max_streams_in requests per connection.  Mitigated by the
+    // max_streams_in setting (default here: 1000).
     int r = lsquic_stream_shutdown(stream_, 1); // SHUT_WR
     if (r == 0) {
-        // Already shut down or will complete asynchronously.
+        // Close initiated; on_close fires once both directions are done.
         if (shutdown_cb_) {
             auto cb = std::move(shutdown_cb_);
             cb({});
         }
     }
-    // If r != 0, the close callback will fire later.
+    // If r != 0 (already closed), the close callback has fired / will fire.
 }
 
 std::string QuicTransportStream::stream_id() const { return id_; }
