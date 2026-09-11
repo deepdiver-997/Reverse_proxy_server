@@ -10,6 +10,7 @@ extern "C" {
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <mutex>
 #include <sstream>
 #include <sys/socket.h>
@@ -680,6 +681,21 @@ QuicServerEngine::QuicServerEngine(asio::io_context& io, SslCtxPtr ssl_ctx,
         settings.es_max_streams_in        = max_streams_in;
     }
     api.ea_settings = &settings;
+    // Routing-byte CIDs (see docs/design-multi-ingress.md): SCID[0] encodes
+    // this engine's worker index so the demux (and later the BPF ingress)
+    // can steer every packet — including post-Retry SCIDs — to the owner
+    // without a registration table.  Uses the callback's lazy read: the
+    // worker idx is assigned right after construction, before any handshake.
+    api.ea_generate_scid = [](void *ctx, lsquic_conn_t *, uint8_t *cid,
+                              unsigned len) {
+        auto *self = static_cast<QuicServerEngine *>(ctx);
+        thread_local std::mt19937_64 rng{std::random_device{}()};
+        for (unsigned i = 1; i < len; ++i)
+            cid[i] = (uint8_t) rng();
+        cid[0] = self->worker_idx_ >= 0 ? (uint8_t) self->worker_idx_
+                                        : (uint8_t) rng();
+    };
+    api.ea_gen_scid_ctx = this;
 
     unsigned flags = LSENG_SERVER | LSENG_HTTP;
 

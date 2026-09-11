@@ -93,3 +93,14 @@ b) 新增 `proxy.toml max_streams_in`（同时设 `es_init_max_streams_bidi` 与
 - 结论：**单 worker 打满**。num_threads>1 在当前 src-IP 哈希下对环回无效
   （同 IP 全落 worker 0）——这正是 Phase 2 要解决的，见
   docs/design-multi-ingress.md（路由字节 CID 方案）。
+## Phase 2a 验收（路由字节 CID，2026-09-11）
+
+| num_threads | 50 conn × w8 / 20000 req | 吞吐 |
+|---|---|---|
+| 1 | 86.2s | ~231 rps（单 worker 饱和，400 并发流下非线性劣化） |
+| 2 | 10.1s | ~1980 rps |
+| 4 | 5.7s | ~3490 rps |
+
+实施：`ea_generate_scid` 产出 SCID[0]=worker idx；demux 未知 CID 先查路由字节、
+否则按 DCID 字节哈希（替换原 src-IP 哈希，解除环回/同 NAT 倾斜）。零错误。
+NT=1 的非线性劣化与 50 连接下的客户端行为待深入；NT≥2 后悬崖消失。

@@ -41,7 +41,7 @@ SCID = [worker_idx (1B)] [random (len-1 B)]
 
 ## 4. 实施阶段
 
-### Phase 2a（纯用户态，macOS/Linux 通用，先做）
+### Phase 2a（已实施 ✅ 2026-09-11，见 docs/perf.md 验收表）
 1. `ea_generate_scid`：首字节 = worker idx。
 2. demux `route()`：未知 CID 首字节命中 worker 范围 → 直投；否则回退 IP 哈希。
 3. 代理.toml 暴露 `num_threads` 已有；回归基准：num_threads = 1/2/4，环回
