@@ -121,17 +121,27 @@ NT=1 的非线性劣化与 50 连接下的客户端行为待深入；NT≥2 后�
 |---|---|---|
 | 2026-09-11 | NT=4，4 客户端进程 × (10 conn × w4)，20000 req | **~4430 rps**，0 错误 |
 
-## 待查：lsquic_stream_close() 会丢弃缓冲响应（2026-09-11）
+## 已定案：lsquic_stream_close() 在 Release 下不可用（2026-09-11，规范重测）
 
-理论上更正确的 `lsquic_stream_close()`（flush+FIN+释放流槽位，可让 MAX_STREAMS
-信用归还）在我们的 relay 上下文里导致**响应永远不到达客户端**（flush 前置也无效，
-客户端 0 完成，且不再发后续请求）。已回退为 `lsquic_stream_shutdown(SHUT_WR)`：
-响应投递可靠，代价是流对象滞留至 idle 超时、流信用不归还 → keep-alive 客户端
-每连接上限 ≈ `max_streams_in`（当前配置 1000）。
+规范化的对照实验（干净构建 + 完整重建对象 + 重链接）确认：
 
-怀疑与异步写完成语义（write 回调 ≠ 数据出包）及 drain/close 时序有关。
-**Phase 2b 在 Linux 容器里用 Debug 构建重查**（Release 下 LSQ_DEBUG 被编译掉，
-无法观测）。
+- **Release 构建 + `lsquic_stream_close()`：完全停摆**。响应帧进入
+  lsquic 的 buffered queue 后**永不出队**（Debug 日志可见
+  "generated STREAM frame fin:1"，但整个连接生命周期内无对应 TX 包），
+  客户端 0 完成（10c w4 5000 req → 30s 停滞；1 conn 顺序 1500 → 10s 零完成）。
+- **Debug 构建 + close()：功能正常但 TTFB 尖刺 ~500ms**（响应被缓冲到
+  PTO 定时器才发出），5/5 完成。
+- **SHUT_WR（现行代码）：响应立即出包**，稳定 **~9860 rps**
+  （10c w4 / 5000 req，0.589s），代价是流对象滞留至 idle 超时、
+  MAX_STREAMS 信用不归还 → keep-alive 每连接上限 ≈ `max_streams_in`（1000）。
+
+结论：保持 SHUT_WR。Debug/Release 行为差异指向 lsquic 内部与 NDEBUG 相关的
+路径（疑似 close() 后缓冲包的 flush 决策依赖仅 Debug 下活跃的代码），
+留待 Phase 2b 在 Linux Debug 构建中定位后上报上游。
+
+> 教训：性能实验必须完整重建对象文件并重链接后再测——本次曾因混用
+> 实验态对象与旧库得出互相矛盾的结论（详见本文件 git 历史中
+> "close() 会丢弃缓冲响应"一段的演进）。
 
 ## 当前基线（max_streams_in=1000 + SHUT_WR）
 
