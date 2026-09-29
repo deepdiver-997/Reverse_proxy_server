@@ -2,8 +2,11 @@
 #
 # Build chain (see docs/ci.md): Go → BoringSSL → lsquic (+ A+B interop patch)
 # → project (C++17).  third_party/{lsquic,boringssl} are gitlink submodules;
-# the interop patch is applied at build time by scripts/ensure_lsquic_patch.sh
-# (the CMake `lsquic-patch-guard` target re-verifies it on every link).
+# the interop patch is applied directly in the build step; the full
+# scripts/ensure_lsquic_patch.sh guard runs post-build ("Patch guard
+# self-check") — it requires the prebuilt liblsquic.a to exist, so it must
+# never run before the lsquic build.  Locally the CMake `lsquic-patch-guard`
+# target re-verifies it on every link.
 
 name: ci
 
@@ -57,7 +60,18 @@ jobs:
 
       - name: Apply interop patch + build lsquic
         run: |
-          bash scripts/ensure_lsquic_patch.sh
+          # Apply the patch directly and idempotently.  Do NOT run
+          # scripts/ensure_lsquic_patch.sh here: it hard-requires a prebuilt
+          # liblsquic.a (its stale-lib check), which cannot exist before the
+          # first build on a fresh CI checkout.  The guard's full check runs
+          # after the build — see the "Patch guard self-check" step below.
+          PATCH="$PWD/docs/lsquic-http3-interop-a-b.patch"
+          if git -C third_party/lsquic apply --check "$PATCH" 2>/dev/null; then
+            git -C third_party/lsquic apply "$PATCH"
+            echo "==> interop patch applied"
+          else
+            echo "==> interop patch already applied"
+          fi
           cmake -S third_party/lsquic -B third_party/lsquic/build \
             -DLSQUIC_LIBSSL=BORINGSSL \
             -DBORINGSSL_INCLUDE=$PWD/third_party/boringssl/include \
