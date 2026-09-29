@@ -630,8 +630,8 @@ static const struct lsquic_stream_if kServerStreamIf = {
     .on_read        = read_cb,
     .on_write       = write_cb,
     .on_close       = close_cb,
-    .on_reset       = reset_cb,
     .on_hsk_done    = hsk_done_cb,
+    .on_reset       = reset_cb,
 };
 
 static const struct lsquic_stream_if kClientStreamIf = {
@@ -641,8 +641,8 @@ static const struct lsquic_stream_if kClientStreamIf = {
     .on_read        = read_cb,
     .on_write       = write_cb,
     .on_close       = close_cb,
-    .on_reset       = reset_cb,
     .on_hsk_done    = hsk_done_cb,
+    .on_reset       = reset_cb,
 };
 
 // ═══════════════════════════════════════════════════════════

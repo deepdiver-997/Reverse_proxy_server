@@ -171,8 +171,8 @@ static const lsquic_stream_if kStreamIf = {
     .on_read        = on_read,
     .on_write       = on_write,
     .on_close       = on_close,
-    .on_reset       = on_reset,
     .on_hsk_done    = on_hsk_done,
+    .on_reset       = on_reset,
 };
 
 // ── SCID reporting ────────────────────────────────────────
