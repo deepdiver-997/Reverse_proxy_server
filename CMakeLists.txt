@@ -9,7 +9,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Dependencies ──────────────────────────────────────────
 
-# asio is header-only; brew puts it in /opt/homebrew/include (already on path)
+# asio is header-only.  Resolve once; targets add it as a PRIVATE -I placed
+# AFTER ${BORINGSSL_ROOT}/include.  -I dirs are searched before -isystem, so
+# the BoringSSL <openssl/*.h> keeps winning over Homebrew's OpenSSL headers —
+# do NOT hoist this path above the BoringSSL entry (or via a global
+# include_directories), or ssl.h gets shadowed and SSL_CTX_ctrl sneaks back.
+find_path(ASIO_INCLUDE_DIR asio.hpp PATHS /opt/homebrew/include)
+if(NOT ASIO_INCLUDE_DIR)
+    message(FATAL_ERROR "asio.hpp not found — install asio (brew) or libasio-dev (apt)")
+endif()
 find_package(spdlog REQUIRED)
 find_package(toml11 REQUIRED)
 
@@ -53,6 +61,7 @@ add_executable(ebpf-quic-proxy
 target_include_directories(ebpf-quic-proxy PRIVATE
     src
     ${BORINGSSL_ROOT}/include   # MUST come before system paths
+    ${ASIO_INCLUDE_DIR}
 )
 target_link_libraries(ebpf-quic-proxy PRIVATE
     spdlog::spdlog
@@ -108,7 +117,7 @@ add_executable(proxy_tests
     src/codec/http_message.cpp
     src/config.cpp
 )
-target_include_directories(proxy_tests PRIVATE src /opt/homebrew/include)
+target_include_directories(proxy_tests PRIVATE src ${ASIO_INCLUDE_DIR})
 target_link_libraries(proxy_tests PRIVATE
     Catch2::Catch2WithMain
     spdlog::spdlog
